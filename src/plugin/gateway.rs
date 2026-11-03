@@ -268,6 +268,7 @@ mod tests {
         Config {
             onebot_ws_url: String::new(),
             napcat_token: None,
+            protocol_end: crate::profile::ProtocolProfile::snowluma(),
             upstream_mode: crate::config::UpstreamMode::Plugin,
             core_url: String::new(),
             core_token: None,

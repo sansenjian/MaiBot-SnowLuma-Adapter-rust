@@ -1,9 +1,9 @@
 # maibot-gateway
 
-MaiBot 的 Rust 消息网关（绞杀者模式 Phase 1，方案 A）：替换 MaiBot-Napcat-Adapter 独立进程。
+MaiBot 的 Rust 消息网关（绞杀者模式）：替换官方 Napcat/SnowLuma-Adapter（均已停止更新/转向插件化）。
 
 ```
-NapCat(OneBot v11 WS 服务端) ⇄ maibot-gateway ⇄ Socket.IO(maim_message) ⇄ MaiBot Core
+SnowLuma / NapCat(OneBot v11 WS 服务端) ⇄ maibot-gateway ⇄ Core（socketio 或 plugin RPC）
 ```
 
 ## 配置（环境变量）
@@ -11,7 +11,8 @@ NapCat(OneBot v11 WS 服务端) ⇄ maibot-gateway ⇄ Socket.IO(maim_message) �
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `ONEBOT_WS_URL` | `ws://127.0.0.1:3001` | NapCat 正向 WS 地址 |
-| `NAPCAT_TOKEN` | 空 | NapCat WS 的 Bearer token（不填不发头） |
+| `NAPCAT_TOKEN` | 空 | 协议端 WS 的 Bearer token（不填不发头；SnowLuma 下同时附加 URL `access_token` 参数） |
+| `PROTOCOL_END` | `snowluma` | 协议端画像：`snowluma`（通用 `send_msg`+`message_type`、file 拆 `upload_*_file`、forward 参数键 `messages`）或 `napcat`（`send_group/private_msg`、file 内联、键 `message`） |
 | `UPSTREAM_MODE` | `socketio` | `socketio`（方案 A）或 `plugin`（方案 B） |
 | `CORE_URL` | `http://127.0.0.1:8000` | socketio 模式：Core 的服务端地址 |
 | `CORE_TOKEN` | 空 | socketio 模式：Core Authorization token |
@@ -58,7 +59,7 @@ cargo run --release  # 生产（LTO）
 - 入站：OneBot message 事件 → MessageBase；at 昵称解析、reply 被引预览、forward 查询（均失败降级）；图片/语音下载转 base64（subType 判表情，失败降级占位文本）
 - 去重：`{driver_id}:{message_id}`，TTL 300s / 上限 10000
 - 上行：socket.io client（platform/Authorization 头、单事件 `message`、重连退避）
-- 出站：MessageBase/MessageDict 统一 → OneBot send_* 动作（16 类段映射 + forward 打包）
+- 出站：MessageBase/MessageDict 统一 → OneBot 动作列表（16 类段映射 + forward 打包 + 协议端画像：动作风格/file 拆分/forward 键），对齐 MaiBot-SnowLuma-Adapter；相邻重复 at 自动合并；文本→at 转换待实现（需群成员查询）
 
 ## 已知差距（v3，行为对齐待办）
 

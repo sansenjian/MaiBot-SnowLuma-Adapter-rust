@@ -21,12 +21,18 @@ pub async fn run(
     let mut backoff = config.reconnect_min_interval;
     loop {
         info!(url = %config.onebot_ws_url, "connecting to napcat");
+        // SnowLuma 画像：token 同时走 URL access_token 参数（Bearer 头保留，两者都收）
+        let mut url = config.onebot_ws_url.clone();
+        if config.protocol_end.name == "snowluma" {
+            if let Some(token) = &config.napcat_token {
+                if !url.contains("access_token=") {
+                    let sep = if url.contains('?') { "&" } else { "?" };
+                    url = format!("{url}{sep}access_token={token}");
+                }
+            }
+        }
         let connect_result: anyhow::Result<_> = (|| {
-            let mut request = config
-                .onebot_ws_url
-                .clone()
-                .into_client_request()
-                .map_err(anyhow::Error::msg)?;
+            let mut request = url.into_client_request().map_err(anyhow::Error::msg)?;
             if let Some(token) = &config.napcat_token {
                 request
                     .headers_mut()

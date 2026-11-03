@@ -5,6 +5,7 @@ mod message;
 mod onebot;
 mod outbound;
 mod plugin;
+mod profile;
 mod routing;
 mod upstream;
 
@@ -50,22 +51,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 出站管线：Core 下发 → 编码 OneBot 动作 → NapCat（echo 与查询共用计数器）
+    // 出站管线：Core 下发 → 编码 OneBot 动作列表 → NapCat（echo 与查询共用计数器）
     let action_tx_out = action_tx.clone();
     let api_out = api.clone();
+    let outbound_profile = config.protocol_end.clone();
     tokio::spawn(async move {
         while let Some(msg) = core_recv_rx.recv().await {
             let proxy = to_outbound_shape(&msg);
-            match outbound::build_outbound_action(&proxy, &json!({})) {
-                Ok(action) => {
-                    let frame = json!({
-                        "action": action.action,
-                        "params": action.params,
-                        "echo": api_out.next_echo(),
-                    });
-                    if action_tx_out.send(frame).await.is_err() {
-                        warn!("onebot action channel closed");
-                        break;
+            match outbound::build_outbound_actions(&proxy, &json!({}), &outbound_profile) {
+                Ok(actions) => {
+                    for action in actions {
+                        let frame = json!({
+                            "action": action.action,
+                            "params": action.params,
+                            "echo": api_out.next_echo(),
+                        });
+                        if action_tx_out.send(frame).await.is_err() {
+                            warn!("onebot action channel closed");
+                            return;
+                        }
                     }
                 }
                 Err(e) => {

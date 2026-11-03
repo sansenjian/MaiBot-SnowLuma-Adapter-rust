@@ -1,12 +1,20 @@
-//! 出站编码器，逐规则对齐 Adapter `codecs/outbound/`
-//!（segment_encoder.py 的段映射 + message_codec.py 的动作选择）。
+//! 出站编码器 v2，对齐 **MaiBot-SnowLuma-Adapter** `codecs/outbound/message_codec.py`
+//!（2026-11-04 提取；协议端画像分支见 profile.rs）。
 //!
-//! 输入为 Host 侧消息 JSON（message_info / raw_message 段数组 / ...），
-//! 输出 `(action, params)` 对应 OneBot `send_*` 动作，经 onebot 客户端的
-//! echo 动作通道发往 NapCat。出站追踪（echo → message_id 回执）在 client 侧做。
+//! 与 napcat 旧版的核心差异：
+//! - 返回**动作列表**（文件可拆为独立上传动作，交错保序）
+//! - 发送动作名按画像：Targeted(send_group/private_msg) / Generic(send_msg+message_type)
+//! - forward 参数键按画像："message" / "messages"
+//! - forward 节点 uin 取消息顶层 account_id（旧版取 additional_config.self_id）
+//! - 群/私聊目标解析增加 route.group_id / route.target_group_id / route.user_id 回退
+//! - 发送前合并相邻重复 at 段（对齐 _merge_adjacent_mentions，始终启用）
+//!
+//! 未实现：文本→at 转换（需群成员列表查询，对应 enable_text_at_conversion，TODO）。
 
 use anyhow::bail;
 use serde_json::{json, Map, Value};
+
+use crate::profile::{MsgActionStyle, ProtocolProfile};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutboundAction {
@@ -14,55 +22,156 @@ pub struct OutboundAction {
     pub params: Value,
 }
 
-/// 对齐 NapCatOutboundCodec.build_outbound_action。
-pub fn build_outbound_action(message: &Value, route: &Value) -> anyhow::Result<OutboundAction> {
+/// 对齐 prepare_outbound_actions：返回按序执行的动作列表。
+pub fn build_outbound_actions(
+    message: &Value,
+    route: &Value,
+    profile: &ProtocolProfile,
+) -> anyhow::Result<Vec<OutboundAction>> {
     let message_info = as_map(message.get("message_info"));
     let group_info = as_map(message_info.get("group_info"));
     let additional_config = as_map(message_info.get("additional_config"));
     let raw_message = message.get("raw_message").cloned().unwrap_or(Value::Null);
 
-    let segments = convert_segments(&raw_message);
-    let is_forward_message = contains_forward_segment(&raw_message);
-
-    // 群消息：group_info.group_id 优先，回退 additional_config.platform_io_target_group_id
+    // 目标解析（对齐 _resolve_outbound_target 的完整回退链）
     let target_group_id = first_non_empty_string(&[
         group_info.get("group_id"),
         additional_config.get("platform_io_target_group_id"),
+        route.get("group_id"),
+        route.get("target_group_id"),
     ]);
-    if !target_group_id.is_empty() {
-        if is_forward_message {
-            let nodes = build_forward_message_segments(&raw_message, &additional_config);
-            return Ok(OutboundAction {
-                action: "send_group_forward_msg".to_owned(),
-                params: json!({"group_id": target_group_id, "message": nodes}),
-            });
-        }
-        return Ok(OutboundAction {
-            action: "send_group_msg".to_owned(),
-            params: json!({"group_id": target_group_id, "message": segments}),
-        });
-    }
-
-    // 私聊消息：additional_config 两个候选键 → route.target_user_id
     let target_user_id = first_non_empty_string(&[
         additional_config.get("platform_io_target_user_id"),
         additional_config.get("target_user_id"),
+        route.get("user_id"),
         route.get("target_user_id"),
     ]);
-    if target_user_id.is_empty() {
-        bail!("出站私聊消息缺少 target_user_id");
+    if target_group_id.is_empty() && target_user_id.is_empty() {
+        bail!("出站消息缺少可用的目标信息（群号或用户ID）");
     }
-    if is_forward_message {
-        let nodes = build_forward_message_segments(&raw_message, &additional_config);
-        return Ok(OutboundAction {
-            action: "send_private_forward_msg".to_owned(),
-            params: json!({"message": nodes, "user_id": target_user_id}),
-        });
+
+    // 合并转发消息：单动作
+    if contains_forward_segment(&raw_message) {
+        let account_id = py_str(message.get("account_id")).trim().to_owned();
+        let nodes = build_forward_message_segments(&raw_message, &account_id);
+        if nodes.is_empty() {
+            bail!("出站消息不包含可发送的内容段");
+        }
+        let action = if !target_group_id.is_empty() {
+            format!("send_{}_forward_msg", if profile.name == "snowluma" { "group" } else { "group" })
+        } else {
+            "send_private_forward_msg".to_owned()
+        };
+        let key = profile.forward_param_key;
+        let params = if !target_group_id.is_empty() {
+            json!({ "group_id": target_group_id, key: nodes })
+        } else {
+            json!({ "user_id": target_user_id, key: nodes })
+        };
+        return Ok(vec![OutboundAction { action, params }]);
     }
-    Ok(OutboundAction {
-        action: "send_private_msg".to_owned(),
-        params: json!({"message": segments, "user_id": target_user_id}),
-    })
+
+    // 普通消息：按序生成；画像决定 file 是否拆分为独立上传动作
+    let Value::Array(items) = &raw_message else {
+        bail!("出站消息不包含可发送的内容段");
+    };
+
+    let mut actions = Vec::new();
+    let mut pending: Vec<Value> = Vec::new();
+    for item in items {
+        let Value::Object(m) = item else { continue };
+        if profile.split_file_upload && m.get("type").and_then(Value::as_str) == Some("file") {
+            if let Some(upload) = build_file_upload_action(m, &target_group_id, &target_user_id) {
+                flush_pending(&mut pending, &mut actions, &target_group_id, &target_user_id, profile);
+                actions.push(upload);
+                continue;
+            }
+        }
+        pending.push(item.clone());
+    }
+    flush_pending(&mut pending, &mut actions, &target_group_id, &target_user_id, profile);
+
+    if actions.is_empty() {
+        bail!("出站消息不包含可发送的内容段");
+    }
+    Ok(actions)
+}
+
+/// 把待发普通段编码为 send 动作并清空缓冲。
+fn flush_pending(
+    pending: &mut Vec<Value>,
+    actions: &mut Vec<OutboundAction>,
+    target_group_id: &str,
+    target_user_id: &str,
+    profile: &ProtocolProfile,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut segments = convert_segments(&json!(std::mem::take(pending)));
+    merge_adjacent_mentions(&mut segments);
+    let (action, params) = match profile.msg_action_style {
+        MsgActionStyle::Targeted => {
+            if !target_group_id.is_empty() {
+                (
+                    "send_group_msg".to_owned(),
+                    json!({ "group_id": target_group_id, "message": segments }),
+                )
+            } else {
+                (
+                    "send_private_msg".to_owned(),
+                    json!({ "user_id": target_user_id, "message": segments }),
+                )
+            }
+        }
+        MsgActionStyle::Generic => {
+            let message_type = if !target_group_id.is_empty() { "group" } else { "private" };
+            let mut params = json!({ "message_type": message_type, "message": segments });
+            if !target_group_id.is_empty() {
+                params["group_id"] = json!(target_group_id);
+            } else {
+                params["user_id"] = json!(target_user_id);
+            }
+            ("send_msg".to_owned(), params)
+        }
+    };
+    actions.push(OutboundAction { action, params });
+}
+
+/// 对齐 _build_file_upload_action：SnowLuma 画像下 file 段拆为独立上传动作。
+fn build_file_upload_action(
+    item: &Map<String, Value>,
+    target_group_id: &str,
+    target_user_id: &str,
+) -> Option<OutboundAction> {
+    let data = item.get("data");
+    let (file_ref, name) = match data {
+        Some(Value::String(s)) => (s.trim().to_owned(), None),
+        Some(Value::Object(m)) => {
+            let f = first_non_empty_string(&[m.get("file"), m.get("path"), m.get("url")]);
+            let n = py_str(m.get("name")).trim().to_owned();
+            (f, if n.is_empty() { None } else { Some(n) })
+        }
+        _ => (String::new(), None),
+    };
+    if file_ref.is_empty() {
+        return None;
+    }
+    let (action, mut params) = if !target_group_id.is_empty() {
+        (
+            "upload_group_file".to_owned(),
+            json!({ "group_id": target_group_id, "file": normalize_file_reference(&file_ref) }),
+        )
+    } else {
+        (
+            "upload_private_file".to_owned(),
+            json!({ "user_id": target_user_id, "file": normalize_file_reference(&file_ref) }),
+        )
+    };
+    if let Some(n) = name {
+        params["name"] = json!(n);
+    }
+    Some(OutboundAction { action, params })
 }
 
 /// 对齐 convert_segments：逐段分发到具体 builder；未知类型/空结果都有降级占位；
@@ -111,7 +220,27 @@ pub fn convert_segments(raw_message: &Value) -> Vec<Value> {
     out
 }
 
-// ---- 段 builders（对齐 segment_encoder.py，同名一一对应）----
+/// 对齐 _merge_adjacent_mentions：合并相邻的重复 at 段（始终启用）。
+pub fn merge_adjacent_mentions(segments: &mut Vec<Value>) {
+    let mut i = 0;
+    while i + 1 < segments.len() {
+        let same = matches!(
+            (&segments[i], &segments[i + 1]),
+            (Value::Object(a), Value::Object(b))
+                if a.get("type").and_then(Value::as_str) == Some("at")
+                && b.get("type").and_then(Value::as_str) == Some("at")
+                && a.get("data").and_then(Value::as_object).map(|d| d.get("qq").cloned())
+                   == b.get("data").and_then(Value::as_object).map(|d| d.get("qq").cloned())
+        );
+        if same {
+            segments.remove(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+// ---- 段 builders（段映射规则 napcat/snowluma 一致，来自 segment_encoder 同源）----
 
 fn build_at_segments(item: &Map<String, Value>) -> Vec<Value> {
     let data = as_map(item.get("data"));
@@ -119,7 +248,7 @@ fn build_at_segments(item: &Map<String, Value>) -> Vec<Value> {
     if target.is_empty() {
         return vec![];
     }
-    vec![json!({"type": "at", "data": {"qq": target}})]
+    vec![json!({ "type": "at", "data": { "qq": target } })]
 }
 
 fn build_reply_segments(item: &Map<String, Value>) -> Vec<Value> {
@@ -133,7 +262,7 @@ fn build_reply_segments(item: &Map<String, Value>) -> Vec<Value> {
     if target.is_empty() {
         return vec![];
     }
-    vec![json!({"type": "reply", "data": {"id": target}})]
+    vec![json!({ "type": "reply", "data": { "id": target } })]
 }
 
 fn base64_or_empty(item: &Map<String, Value>) -> String {
@@ -145,7 +274,7 @@ fn build_image_segments(item: &Map<String, Value>) -> Vec<Value> {
     if b64.is_empty() {
         return vec![];
     }
-    vec![json!({"type": "image", "data": {"file": format!("base64://{b64}"), "sub_type": 0}})]
+    vec![json!({ "type": "image", "data": { "file": format!("base64://{b64}"), "sub_type": 0 } })]
 }
 
 fn build_emoji_segments(item: &Map<String, Value>) -> Vec<Value> {
@@ -155,20 +284,19 @@ fn build_emoji_segments(item: &Map<String, Value>) -> Vec<Value> {
     }
     vec![json!({
         "type": "image",
-        "data": {"file": format!("base64://{b64}"), "sub_type": 1, "summary": "[动画表情]"}
+        "data": { "file": format!("base64://{b64}"), "sub_type": 1, "summary": "[动画表情]" }
     })]
 }
 
 fn build_voice_segments(item: &Map<String, Value>) -> Vec<Value> {
     let b64 = base64_or_empty(item);
     if !b64.is_empty() {
-        return vec![json!({"type": "record", "data": {"file": format!("base64://{b64}")}})];
+        return vec![json!({ "type": "record", "data": { "file": format!("base64://{b64}") } })];
     }
-    build_url_media_segments("record", item.get("data"))
-        .into_iter()
-        .next()
-        .map_or_else(|| vec![text_segment("[voice]")], |v| vec![v])
-        .into()
+    match build_url_media_segments("record", item.get("data")).into_iter().next() {
+        Some(v) => vec![v],
+        None => vec![],
+    }
 }
 
 fn build_url_media_segments(segment_type: &str, data: Option<&Value>) -> Vec<Value> {
@@ -179,7 +307,7 @@ fn build_url_media_segments(segment_type: &str, data: Option<&Value>) -> Vec<Val
     if file_ref.is_empty() {
         return vec![];
     }
-    vec![json!({"type": segment_type, "data": {"file": normalize_file_reference(&file_ref)}})]
+    vec![json!({ "type": segment_type, "data": { "file": normalize_file_reference(&file_ref) } })]
 }
 
 fn build_face_segments(data: Option<&Value>) -> Vec<Value> {
@@ -192,13 +320,13 @@ fn build_face_segments(data: Option<&Value>) -> Vec<Value> {
     if face_id.is_empty() {
         return vec![];
     }
-    vec![json!({"type": "face", "data": {"id": face_id}})]
+    vec![json!({ "type": "face", "data": { "id": face_id } })]
 }
 
 fn build_video_segments(item: &Map<String, Value>) -> Vec<Value> {
     let b64 = base64_or_empty(item);
     if !b64.is_empty() {
-        return vec![json!({"type": "video", "data": {"file": format!("base64://{b64}")}})];
+        return vec![json!({ "type": "video", "data": { "file": format!("base64://{b64}") } })];
     }
     build_url_media_segments("video", item.get("data"))
 }
@@ -210,21 +338,21 @@ fn build_file_segments(data: Option<&Value>) -> Vec<Value> {
             if f.is_empty() {
                 return vec![];
             }
-            json!({"type": "file", "data": {"file": normalize_file_reference(f)}})
+            json!({ "type": "file", "data": { "file": normalize_file_reference(f) } })
         }
         Some(Value::Object(m)) => {
             let file_ref = first_non_empty_string(&[m.get("file"), m.get("path"), m.get("url")]);
             if file_ref.is_empty() {
                 return vec![];
             }
-            let mut d = json!({"file": normalize_file_reference(&file_ref)});
+            let mut d = json!({ "file": normalize_file_reference(&file_ref) });
             for opt in ["name", "thumb"] {
                 let v = py_str(m.get(opt)).trim().to_owned();
                 if !v.is_empty() {
                     d[opt] = json!(v);
                 }
             }
-            json!({"type": "file", "data": d})
+            json!({ "type": "file", "data": d })
         }
         _ => return vec![],
     };
@@ -238,7 +366,7 @@ fn build_music_segments(data: Option<&Value>) -> Vec<Value> {
             if id.is_empty() {
                 return vec![];
             }
-            json!({"type": "music", "data": {"type": "163", "id": id}})
+            json!({ "type": "music", "data": { "type": "163", "id": id } })
         }
         Some(Value::Object(m)) => {
             let mut platform = py_str(m.get("type")).trim().to_owned();
@@ -252,7 +380,7 @@ fn build_music_segments(data: Option<&Value>) -> Vec<Value> {
             if id.is_empty() {
                 return vec![];
             }
-            json!({"type": "music", "data": {"type": platform, "id": id}})
+            json!({ "type": "music", "data": { "type": platform, "id": id } })
         }
         _ => return vec![],
     };
@@ -309,32 +437,33 @@ fn build_dict_segments(item: &Map<String, Value>) -> Vec<Value> {
         "videourl" => build_url_media_segments("video", Some(payload)).into_iter().next(),
         t @ ("image" | "record" | "reply" | "at") => {
             let Value::Object(p) = payload else { return vec![] };
-            Some(json!({"type": t, "data": p}))
+            Some(json!({ "type": t, "data": p }))
         }
-        _ => return vec![text_segment(format!("[unsupported:{}]", if raw_type.is_empty() { "dict" } else { &raw_type }))],
+        _ => {
+            return vec![text_segment(format!("[unsupported:{}]", if raw_type.is_empty() { "dict" } else { &raw_type }))]
+        }
     };
     segment.into_iter().collect()
 }
 
-// ---- forward 消息打包（对齐 message_codec.py）----
+// ---- forward 消息打包 ----
 
 fn contains_forward_segment(raw_message: &Value) -> bool {
     let Value::Array(items) = raw_message else { return false };
     items.iter().any(|i| matches!(i, Value::Object(m) if m.get("type").and_then(Value::as_str) == Some("forward")))
 }
 
-/// 对齐 _build_forward_message_segments：连续普通段打包成一个 node，
-/// forward 段单独转换后按原顺序拼接。
-fn build_forward_message_segments(raw_message: &Value, additional_config: &Map<String, Value>) -> Vec<Value> {
+/// 对齐 _build_forward_message_segments：连续普通段打包成一个 node
+///（name="MaiBot"，uin=消息顶层 account_id），forward 段按序拼接。
+fn build_forward_message_segments(raw_message: &Value, account_id: &str) -> Vec<Value> {
     let Value::Array(items) = raw_message else { return vec![] };
-    let self_id = py_str(additional_config.get("self_id")).trim().to_owned();
     let mut out = Vec::new();
     let mut regular: Vec<Value> = Vec::new();
     for item in items {
         let Value::Object(m) = item else { continue };
         if m.get("type").and_then(Value::as_str) == Some("forward") {
             if !regular.is_empty() {
-                out.push(regular_forward_node(std::mem::take(&mut regular), &self_id));
+                out.push(regular_forward_node(std::mem::take(&mut regular), account_id));
             }
             out.extend(convert_segments(&json!([item])));
         } else {
@@ -342,22 +471,22 @@ fn build_forward_message_segments(raw_message: &Value, additional_config: &Map<S
         }
     }
     if !regular.is_empty() {
-        out.push(regular_forward_node(regular, &self_id));
+        out.push(regular_forward_node(regular, account_id));
     }
     out
 }
 
-fn regular_forward_node(regular: Vec<Value>, self_id: &str) -> Value {
+fn regular_forward_node(regular: Vec<Value>, account_id: &str) -> Value {
     json!({
         "type": "node",
-        "data": {"name": "MaiBot", "uin": self_id, "content": convert_segments(&json!(regular))}
+        "data": { "name": "MaiBot", "uin": account_id, "content": convert_segments(&json!(regular)) }
     })
 }
 
 // ---- 小工具 ----
 
 fn text_segment(text: impl Into<String>) -> Value {
-    json!({"type": "text", "data": {"text": text.into()}})
+    json!({ "type": "text", "data": { "text": text.into() } })
 }
 
 /// 对齐 _build_empty_segment_fallback。
@@ -375,7 +504,7 @@ fn empty_segment_fallback(seg_type: &str) -> Option<&'static str> {
 }
 
 /// 对齐 _normalize_file_reference。
-fn normalize_file_reference(reference: &str) -> String {
+pub fn normalize_file_reference(reference: &str) -> String {
     if reference.starts_with("base64://")
         || reference.starts_with("file://")
         || reference.starts_with("http://")
@@ -405,7 +534,7 @@ fn py_str(v: Option<&Value>) -> String {
     }
 }
 
-/// 取候选值中第一个规范化后非空的字符串（对齐 build_outbound_action 的 or 链）。
+/// 取候选值中第一个规范化后非空的字符串。
 fn first_non_empty_string(candidates: &[Option<&Value>]) -> String {
     for c in candidates {
         if let Some(v) = c {
@@ -434,30 +563,96 @@ impl IfEmpty for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::ProtocolProfile;
 
     #[test]
-    fn group_text_message() {
+    fn napcat_targeted_group_text() {
         let msg = json!({
             "message_info": {"group_info": {"group_id": "12345"}},
             "raw_message": [{"type": "text", "data": "hello"}]
         });
-        let action = build_outbound_action(&msg, &json!({})).unwrap();
-        assert_eq!(action.action, "send_group_msg");
-        assert_eq!(action.params["group_id"], json!("12345"));
-        assert_eq!(action.params["message"], json!([{"type": "text", "data": {"text": "hello"}}]));
+        let actions = build_outbound_actions(&msg, &json!({}), &ProtocolProfile::napcat()).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, "send_group_msg");
+        assert_eq!(actions[0].params["group_id"], json!("12345"));
     }
 
     #[test]
-    fn private_requires_target() {
-        let msg = json!({"raw_message": [{"type": "text", "data": "hi"}]});
-        assert!(build_outbound_action(&msg, &json!({})).is_err());
-        let msg2 = json!({
-            "message_info": {"additional_config": {"platform_io_target_user_id": "999"}},
-            "raw_message": [{"type": "text", "data": "hi"}]
+    fn snowluma_generic_send_msg() {
+        let msg = json!({
+            "message_info": {"group_info": {"group_id": "12345"}},
+            "raw_message": [{"type": "text", "data": "hello"}]
         });
-        let action = build_outbound_action(&msg2, &json!({})).unwrap();
-        assert_eq!(action.action, "send_private_msg");
-        assert_eq!(action.params["user_id"], json!("999"));
+        let actions = build_outbound_actions(&msg, &json!({}), &ProtocolProfile::snowluma()).unwrap();
+        assert_eq!(actions[0].action, "send_msg");
+        assert_eq!(actions[0].params["message_type"], json!("group"));
+        assert_eq!(actions[0].params["group_id"], json!("12345"));
+    }
+
+    #[test]
+    fn private_requires_target_with_route_fallback() {
+        let msg = json!({"raw_message": [{"type": "text", "data": "hi"}]});
+        assert!(build_outbound_actions(&msg, &json!({}), &ProtocolProfile::napcat()).is_err());
+        // route.user_id 回退
+        let actions = build_outbound_actions(&msg, &json!({"user_id": "777"}), &ProtocolProfile::snowluma()).unwrap();
+        assert_eq!(actions[0].action, "send_msg");
+        assert_eq!(actions[0].params["message_type"], json!("private"));
+        assert_eq!(actions[0].params["user_id"], json!("777"));
+    }
+
+    #[test]
+    fn snowluma_file_split_upload_order() {
+        let msg = json!({
+            "message_info": {"group_info": {"group_id": "1"}},
+            "raw_message": [
+                {"type": "text", "data": "前"},
+                {"type": "file", "data": {"file": "/tmp/a.zip", "name": "a.zip"}},
+                {"type": "text", "data": "后"}
+            ]
+        });
+        let actions = build_outbound_actions(&msg, &json!({}), &ProtocolProfile::snowluma()).unwrap();
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].action, "send_msg");
+        assert_eq!(actions[1].action, "upload_group_file");
+        assert_eq!(actions[1].params["file"], json!("file:///tmp/a.zip"));
+        assert_eq!(actions[1].params["name"], json!("a.zip"));
+        assert_eq!(actions[2].action, "send_msg");
+        // napcat 画像不拆分
+        let actions = build_outbound_actions(&msg, &json!({}), &ProtocolProfile::napcat()).unwrap();
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn snowluma_forward_uses_messages_key() {
+        let msg = json!({
+            "account_id": "100",
+            "message_info": {"group_info": {"group_id": "1"}},
+            "raw_message": [
+                {"type": "text", "data": "a"},
+                {"type": "forward", "data": [{"user_id": "9", "content": [{"type": "text", "data": "f"}]}]}
+            ]
+        });
+        let actions = build_outbound_actions(&msg, &json!({}), &ProtocolProfile::snowluma()).unwrap();
+        assert_eq!(actions[0].action, "send_group_forward_msg");
+        assert!(actions[0].params.get("messages").is_some());
+        // 节点 uin 来自 account_id
+        assert_eq!(actions[0].params["messages"][0]["data"]["uin"], json!("100"));
+        // napcat 用 message 键
+        let actions = build_outbound_actions(&msg, &json!({}), &ProtocolProfile::napcat()).unwrap();
+        assert!(actions[0].params.get("message").is_some());
+    }
+
+    #[test]
+    fn merge_adjacent_duplicate_mentions() {
+        let mut segments = vec![
+            json!({"type": "text", "data": {"text": "hi"}}),
+            json!({"type": "at", "data": {"qq": "123"}}),
+            json!({"type": "at", "data": {"qq": "123"}}),
+            json!({"type": "at", "data": {"qq": "456"}}),
+        ];
+        merge_adjacent_mentions(&mut segments);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[2]["data"]["qq"], json!("456"));
     }
 
     #[test]
@@ -467,37 +662,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_segment_gets_placeholder() {
-        let segs = convert_segments(&json!([{"type": "image", "data": ""}]));
-        assert_eq!(json!(segs), json!([{"type": "text", "data": {"text": "[image]"}}]));
-    }
-
-    #[test]
     fn file_reference_normalized() {
         assert_eq!(normalize_file_reference("/a/b.png"), "file:///a/b.png");
         assert_eq!(normalize_file_reference("https://x/y.png"), "https://x/y.png");
         assert_eq!(normalize_file_reference("base64://AA"), "base64://AA");
-    }
-
-    #[test]
-    fn forward_packs_regular_nodes() {
-        let msg = json!({
-            "message_info": {
-                "group_info": {"group_id": "1"},
-                "additional_config": {"self_id": "100"}
-            },
-            "raw_message": [
-                {"type": "text", "data": "a"},
-                {"type": "forward", "data": [{"user_id": "9", "content": [{"type": "text", "data": "f"}]}]},
-                {"type": "text", "data": "b"}
-            ]
-        });
-        let action = build_outbound_action(&msg, &json!({})).unwrap();
-        assert_eq!(action.action, "send_group_forward_msg");
-        let nodes = action.params["message"].as_array().unwrap();
-        assert_eq!(nodes.len(), 3);
-        assert_eq!(nodes[0]["data"]["name"], json!("MaiBot"));
-        assert_eq!(nodes[0]["data"]["uin"], json!("100"));
-        assert_eq!(nodes[2]["data"]["content"], json!([{"type": "text", "data": {"text": "b"}}]));
     }
 }

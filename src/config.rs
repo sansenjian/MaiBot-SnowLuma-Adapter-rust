@@ -14,6 +14,8 @@ pub struct Config {
     pub onebot_ws_url: String,
     /// NapCat 正向 WS 的 Bearer token（NapCat 侧配置，可选）
     pub napcat_token: Option<String>,
+    /// 协议端画像：napcat / snowluma（默认 snowluma，对齐当前官方生态）
+    pub protocol_end: crate::profile::ProtocolProfile,
     pub upstream_mode: UpstreamMode,
 
     // ---- socketio 模式（方案 A）----
@@ -52,6 +54,9 @@ impl Config {
             onebot_ws_url: std::env::var("ONEBOT_WS_URL")
                 .unwrap_or_else(|_| "ws://127.0.0.1:3001".into()),
             napcat_token: std::env::var("NAPCAT_TOKEN").ok().filter(|s| !s.is_empty()),
+            protocol_end: crate::profile::ProtocolProfile::from_name(
+                &std::env::var("PROTOCOL_END").unwrap_or_else(|_| "snowluma".into()),
+            ),
             upstream_mode,
             core_url: std::env::var("CORE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8000".into()),
