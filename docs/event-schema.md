@@ -211,15 +211,29 @@ music→music(type∈{163,qq} 默认 163, id)；forward→node 列表；
 dict→按内嵌 type 分发；未知类型→`[unsupported:xxx]` 占位文本。
 空数据段有专门的降级占位（[image]/[voice]/[emoji]...），整个列表为空时兜底一个空 text 段。
 
-## 9. 架构分叉与 P1 目标选择（待定，需用户拍板）
+## 9. 架构分叉与 P1 目标选择（2026-11-03 更新）
 
 当前 main 分支的 Adapter **同时是 MaiBot 插件**（maibot_sdk `@MessageGateway`，
 in-process 走 PluginPlatformDriver RPC，载荷为 §7.2 MessageDict）。独立 socketio
-进程模式（载荷 §7.1 MessageBase）可能只保留在 stable release。
+进程模式（载荷 §7.1 MessageBase）保留在 stable release。
 
-- **方案 A（推荐）**：钉住 stable release，Rust 网关替换独立 Adapter 进程，
-  speak socket.io client（§5 已完备），MessageBase 载荷。
-- **方案 B**：跟进 main 插件架构，需实现插件 RPC 协议（尚未提取，工作量大）。
+**plugin RPC 协议（方案 B，2026-11-03 提取 + 实现）**：
+- 传输：TCP/UDS，帧 = 4 字节大端长度 + msgpack(Envelope)（`src/plugin_runtime/`）
+- Envelope：`protocol_version "1.0.0"` / `request_id`(int, 从 1 开始) /
+  `message_type`(request|response|broadcast) / `method` / `plugin_id` /
+  `timestamp_ms` / `timeout_ms`(默认 30000) / `payload` / `error{code,message,details}`
+- 生命周期：`runner.hello`(runner_id, sdk_version, session_token，10s 超时) →
+  `plugin.register_components`(ComponentDeclaration.component_type="MESSAGE_GATEWAY"，
+  metadata 带 route_type="duplex"、platform、protocol="napcat") → `runner.ready`
+- 入站：`host.route_message`（⚠️ 推断名）RouteMessagePayload{gateway_name, message
+  (MessageDict), route_metadata, external_message_id, dedupe_key}——**去重在 Host**
+- 出站：`plugin.invoke_message_gateway`（⚠️ 推断名）InvokePayload{component_name,
+  args{message, route, metadata}}；回执 InvokeResultPayload{success, result}
+- 其他：`plugin.health`、`plugin.shutdown`、`plugin.config_updated`(broadcast)、
+  网关状态上报（MessageGatewayStateUpdatePayload）
+- 待核对：transport/base.py 帧头细节；Core 启动 Runner 时注入的 env 变量名
+
+Rust 实现（`UPSTREAM_MODE=plugin`）：`src/plugin/{envelope,client,gateway}.rs`。
 
 ## 10. Rust 映射现状
 

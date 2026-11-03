@@ -15,6 +15,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 rust-socketio = { version = "0.6", features = ["async"] }
+rmp-serde = "1"
 
 [profile.release]
 lto = true

@@ -12,10 +12,30 @@ NapCat(OneBot v11 WS 服务端) ⇄ maibot-gateway ⇄ Socket.IO(maim_message) �
 |---|---|---|
 | `ONEBOT_WS_URL` | `ws://127.0.0.1:3001` | NapCat 正向 WS 地址 |
 | `NAPCAT_TOKEN` | 空 | NapCat WS 的 Bearer token（不填不发头） |
-| `CORE_URL` | `http://127.0.0.1:8000` | Core 的 socket.io 服务端地址 |
-| `CORE_TOKEN` | 空 | Core `enable_token` 时的 Authorization token |
-| `PLATFORM` | `qq` | 连接 Core 的 platform 头 |
-| `DRIVER_ID` | `legacy.send.qq` | 去重键前缀（对齐 Core manager.py 约定） |
+| `UPSTREAM_MODE` | `socketio` | `socketio`（方案 A）或 `plugin`（方案 B） |
+| `CORE_URL` | `http://127.0.0.1:8000` | socketio 模式：Core 的服务端地址 |
+| `CORE_TOKEN` | 空 | socketio 模式：Core Authorization token |
+| `PLUGIN_HOST_ADDRESS` | `127.0.0.1:0` | plugin 模式：Host IPC 地址（TCP） |
+| `PLUGIN_SESSION_TOKEN` | 空 | plugin 模式：握手会话令牌（Core 启动 Runner 时经环境变量下发，变量名待从 Core 启动代码核对） |
+| `PLUGIN_ID` | `maibot_gateway_rust` | plugin 模式：注册的 plugin_id |
+| `GATEWAY_NAME` | `napcat_gateway` | plugin 模式：MessageGateway 组件名 |
+| `PLATFORM` | `qq` | platform 头 / 网关 platform 声明 |
+| `SELF_ID` | 空 | 机器人 QQ 号（plugin 模式写入 additional_config.self_id） |
+| `DRIVER_ID` | `legacy.send.qq` | 去重键前缀 |
+
+## 两种上行模式
+
+**socketio（方案 A，默认）**：对 Core classic MessageServer 说话 socket.io client，
+载荷 MessageBase，本地按 `{driver_id}:{message_id}` 去重。Core 需 stable 独立
+Adapter 部署形态。
+
+**plugin（方案 B）**：作为 Core plugin_runtime 的 Runner 运行，msgpack-RPC over
+TCP（4 字节大端帧头 + msgpack Envelope），注册 `MESSAGE_GATEWAY` 组件（duplex /
+platform / napcat）。入站 MessageBase → MessageDict → `host.route_message`
+（Host 侧用 dedupe_key 去重）；出站 Host 调 `plugin.invoke_message_gateway`，
+args.message 直接进现有出站编码管线。⚠️ `host.route_message` /
+`plugin.invoke_message_gateway` 两个 method 名为推断值，首次联调核对；
+Runner 启动环境变量名同理待核对。
 
 ## Core 侧前提
 
