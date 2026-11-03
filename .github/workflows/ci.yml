@@ -1,0 +1,36 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  unit:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --verbose
+
+  e2e:
+    name: mock e2e (SnowLuma + plugin Host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install msgpack websockets
+      - name: Build gateway
+        run: cargo build
+      - name: Run mocks + gateway + assertions
+        run: |
+          UPSTREAM_MODE=plugin PROTOCOL_END=snowluma           ONEBOT_WS_URL=ws://127.0.0.1:3001 NAPCAT_TOKEN=test-token           PLUGIN_HOST_ADDRESS=127.0.0.1:9500 PLUGIN_SESSION_TOKEN=tok           PLUGIN_ID=maibot_gateway_rust GATEWAY_NAME=napcat_gateway           PLATFORM=qq SELF_ID=100           ./target/debug/maibot-gateway &
+          GW_PID=$!
+          sleep 2
+          python3 e2e/mock_test.py
+          RC=$?
+          kill $GW_PID 2>/dev/null || true
+          exit $RC

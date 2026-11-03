@@ -118,9 +118,14 @@ async fn run_session(
                                     external_id = receipt
                                         .pointer("/data/message_id")
                                         .or(receipt.pointer("/data/data/message_id"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_owned();
+                                        .and_then(|v| {
+                                            v.as_str().map(str::to_owned).or_else(|| {
+                                                v.as_i64()
+                                                    .map(|n| n.to_string())
+                                                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+                                            })
+                                        })
+                                        .unwrap_or_default();
                                 }
                             }
                             Ok(Some(receipt)) => {

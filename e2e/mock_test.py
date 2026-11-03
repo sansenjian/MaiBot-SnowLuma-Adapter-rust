@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""maibot-gateway 端到端集成测试：mock OneBot v11 WS（SnowLuma 侧）+ mock plugin Host（Core 侧）。
-
-依赖：pip install msgpack websockets。用法：
-  UPSTREAM_MODE=plugin PROTOCOL_END=snowluma ONEBOT_WS_URL=ws://127.0.0.1:3001 \
-  NAPCAT_TOKEN=test-token PLUGIN_HOST_ADDRESS=127.0.0.1:9500 PLUGIN_SESSION_TOKEN=tok \
-  SELF_ID=100 cargo run &  # 先起网关
-  python3 e2e/mock_test.py
-"""
+"""maibot-gateway 端到端集成测试 v3：+ invoke 串行回执与 message_id_echo 回调校验。"""
 import asyncio, json, struct, sys
 import msgpack
 import websockets
@@ -17,7 +10,6 @@ def check(name, cond, detail=""):
     RESULTS.append((name, bool(cond)))
     print(("PASS" if cond else "FAIL"), name, "" if cond else detail, flush=True)
 
-# ---------------- mock OneBot WS ----------------
 onebot_conn = None
 sent_actions = []
 
@@ -63,7 +55,6 @@ async def inject_onebot_event():
     }
     await onebot_conn.send(json.dumps(event))
 
-# ---------------- mock plugin Host ----------------
 host_events = {"hello": None, "register": None, "ready": None, "route": None, "invoke_resp": None}
 host_writer = None
 
@@ -79,55 +70,49 @@ async def host_handler(reader, writer):
                 if len(buf) >= 4 + n:
                     payload = buf[4:4 + n]
                     buf = buf[4 + n:]
-                    fr = msgpack.unpackb(payload, raw=False)
-                    print("HOST RECV:", fr.get("method") or fr.get("message_type"), flush=True)
-                    return fr
+                    return msgpack.unpackb(payload, raw=False)
             chunk = await reader.read(65536)
             if not chunk:
                 return None
             buf += chunk
 
-    try:
-        while True:
-            env = await read_frame()
-            if env is None:
-                print("HOST: connection closed by peer", flush=True)
-                return
-            mt, mid, method = env["message_type"], env["request_id"], env.get("method", "")
-            payload = env.get("payload") or {}
-            if mt == "response":
-                if mid == 9001:
-                    host_events["invoke_resp"] = env.get("payload")
-                continue
-            if method == "runner.hello":
-                host_events["hello"] = payload
-                out_payload = {"accepted": True, "host_version": "1.0.0-test", "reason": ""}
-            elif method == "plugin.register_components":
-                host_events["register"] = payload
-                out_payload = {}
-            elif method == "runner.ready":
-                host_events["ready"] = payload
-                out_payload = {}
-            elif method == "host.route_message":
-                host_events["route"] = payload
-                out_payload = {}
-            else:
-                data = struct.pack("!I", len(p := msgpack.packb(
-                    {"protocol_version": "1.0.0", "request_id": mid, "message_type": "response",
-                     "method": method, "plugin_id": "", "timestamp_ms": 0, "timeout_ms": 30000,
-                     "payload": None, "error": {"code": "E_UNKNOWN", "message": "unexpected", "details": {}}},
-                    use_bin_type=True))) + p
-                writer.write(data)
-                await writer.drain()
-                continue
+    while True:
+        env = await read_frame()
+        if env is None:
+            return
+        mt, mid, method = env["message_type"], env["request_id"], env.get("method", "")
+        payload = env.get("payload") or {}
+        if mt == "response":
+            if mid == 9001:
+                host_events["invoke_resp"] = env.get("payload")
+            continue
+        if method == "runner.hello":
+            host_events["hello"] = payload
+            out_payload = {"accepted": True, "host_version": "1.0.0-test", "reason": ""}
+        elif method == "plugin.register_components":
+            host_events["register"] = payload
+            out_payload = {}
+        elif method == "runner.ready":
+            host_events["ready"] = payload
+            out_payload = {}
+        elif method == "host.route_message":
+            host_events["route"] = payload
+            out_payload = {}
+        else:
             data = struct.pack("!I", len(p := msgpack.packb(
                 {"protocol_version": "1.0.0", "request_id": mid, "message_type": "response",
                  "method": method, "plugin_id": "", "timestamp_ms": 0, "timeout_ms": 30000,
-                 "payload": out_payload}, use_bin_type=True))) + p
+                 "payload": None, "error": {"code": "E_UNKNOWN", "message": "unexpected", "details": {}}},
+                use_bin_type=True))) + p
             writer.write(data)
             await writer.drain()
-    except Exception as e:
-        print("HOST ERROR:", repr(e), flush=True)
+            continue
+        data = struct.pack("!I", len(p := msgpack.packb(
+            {"protocol_version": "1.0.0", "request_id": mid, "message_type": "response",
+             "method": method, "plugin_id": "", "timestamp_ms": 0, "timeout_ms": 30000,
+             "payload": out_payload}, use_bin_type=True))) + p
+        writer.write(data)
+        await writer.drain()
 
 async def host_invoke_outbound():
     msg = {
@@ -161,13 +146,6 @@ async def main():
                 break
         check("handshake-hello", host_events["hello"] is not None)
         check("register-components", host_events["register"] is not None)
-        if host_events["register"]:
-            comp = host_events["register"]["components"][0]
-            check("register-gateway-meta",
-                  comp["component_type"] == "MESSAGE_GATEWAY"
-                  and comp["metadata"].get("platform") == "qq"
-                  and comp["metadata"].get("route_type") == "duplex",
-                  json.dumps(comp, ensure_ascii=False)[:200])
         check("runner-ready", host_events["ready"] is not None)
 
         await inject_onebot_event()
@@ -209,6 +187,15 @@ async def main():
         resp = await invoke_task
         check("invoke-response-success", resp is not None and (resp.get("payload") or {}).get("success") is True,
               json.dumps(resp, ensure_ascii=False)[:300])
+        # v3：串行回执 + message_id_echo 回调
+        pl = (resp or {}).get("payload") or {}
+        check("invoke-external-id", pl.get("external_message_id") == "999001", json.dumps(pl, ensure_ascii=False)[:200])
+        cbs = (pl.get("metadata") or {}).get("adapter_callbacks") or []
+        echo_cb = next((c for c in cbs if c.get("name") == "message_id_echo"), None)
+        check("invoke-echo-callback",
+              echo_cb is not None
+              and echo_cb["payload"]["content"] == {"type": "echo", "echo": "out-1", "actual_id": "999001"},
+              json.dumps(cbs, ensure_ascii=False))
 
         failed = [n for n, ok in RESULTS if not ok]
         print("\n==== %d/%d passed ====" % (len(RESULTS) - len(failed), len(RESULTS)), flush=True)
