@@ -1,0 +1,21 @@
+[package]
+name = "maibot-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "MaiBot Rust message gateway (strangler pattern, Phase 1)"
+license = "GPL-3.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+rust-socketio = { version = "0.6", features = ["async"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
