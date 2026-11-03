@@ -5,7 +5,7 @@
 //!
 //! 验收以 Python 版行为回放为准。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 

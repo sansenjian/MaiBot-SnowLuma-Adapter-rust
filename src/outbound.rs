@@ -5,7 +5,7 @@
 //! 输出 `(action, params)` 对应 OneBot `send_*` 动作，经 onebot 客户端的
 //! echo 动作通道发往 NapCat。出站追踪（echo → message_id 回执）在 client 侧做。
 
-use anyhow::{bail, Context};
+use anyhow::bail;
 use serde_json::{json, Map, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -309,7 +309,7 @@ fn build_dict_segments(item: &Map<String, Value>) -> Vec<Value> {
         "videourl" => build_url_media_segments("video", Some(payload)).into_iter().next(),
         t @ ("image" | "record" | "reply" | "at") => {
             let Value::Object(p) = payload else { return vec![] };
-            json!({"type": t, "data": p})
+            Some(json!({"type": t, "data": p}))
         }
         _ => return vec![text_segment(format!("[unsupported:{}]", if raw_type.is_empty() { "dict" } else { &raw_type }))],
     };
@@ -463,13 +463,13 @@ mod tests {
     #[test]
     fn unknown_segment_degrades() {
         let segs = convert_segments(&json!([{"type": "hologram", "data": "x"}]));
-        assert_eq!(segs, json!([{"type": "text", "data": {"text": "[unsupported:hologram]"}}]));
+        assert_eq!(json!(segs), json!([{"type": "text", "data": {"text": "[unsupported:hologram]"}}]));
     }
 
     #[test]
     fn empty_segment_gets_placeholder() {
         let segs = convert_segments(&json!([{"type": "image", "data": ""}]));
-        assert_eq!(segs, json!([{"type": "text", "data": {"text": "[image]"}}]));
+        assert_eq!(json!(segs), json!([{"type": "text", "data": {"text": "[image]"}}]));
     }
 
     #[test]

@@ -93,7 +93,7 @@ impl Default for FormatInfo {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateInfo {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub template_items: HashMap<String, String>,
@@ -105,6 +105,16 @@ pub struct TemplateInfo {
 
 fn default_true() -> bool {
     true
+}
+
+impl Default for TemplateInfo {
+    fn default() -> Self {
+        Self {
+            template_items: Default::default(),
+            template_name: Default::default(),
+            template_default: true,
+        }
+    }
 }
 
 /// 对齐 Seg：type 字段重命名（type 是 Rust 保留字）。

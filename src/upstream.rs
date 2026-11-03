@@ -36,8 +36,7 @@ pub async fn run(
         match builder
             .on("message", move |payload: Payload, _client| {
                 let value = match payload {
-                    Payload::Text(v) => v,
-                    Payload::String(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
+                    Payload::Text(mut v) => v.drain(..).next().unwrap_or(Value::Null),
                     _ => Value::Null,
                 };
                 if !value.is_null() && recv_tx_clone.blocking_send(value).is_err() {
@@ -45,7 +44,6 @@ pub async fn run(
                 }
             })
             .connect()
-            .await
         {
             Ok(socket) => {
                 info!("connected to core");

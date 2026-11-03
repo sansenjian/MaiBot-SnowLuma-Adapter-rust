@@ -350,10 +350,10 @@ fn convert_forward_nodes(nodes: &[Value]) -> Vec<Value> {
             .or(node_data.get("content"))
             .or(m.get("message"))
             .and_then(Value::as_array);
-        let content = content_arr.map(convert_segments_inline).unwrap_or_default();
+        let content = content_arr.map(|c| convert_segments_inline(c)).unwrap_or_default();
 
         let mut n = json!({
-            "user_nickname": if nickname.is_empty() { "未知用户" } else { nickname },
+            "user_nickname": if nickname.is_empty() { "未知用户".to_owned() } else { nickname },
             "message_id": if message_id.is_empty() { format!("node-{}", now_millis()) } else { message_id },
             "content": if content.is_empty() { vec![text_segment("[empty]")] } else { content },
         });
@@ -531,7 +531,8 @@ mod tests {
             }]
         });
         let out = convert_event(&event, "qq", None).await.unwrap();
-        let fwd = &out.message["message_segment"]["data"][0];
+        // 单段 flatten：message_segment 即 forward 段本身
+        let fwd = &out.message["message_segment"];
         assert_eq!(fwd["type"], json!("forward"));
         assert_eq!(fwd["data"][0]["user_nickname"], json!("甲"));
         assert_eq!(fwd["data"][0]["content"][0]["data"], json!("内容"));

@@ -10,10 +10,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tokio::sync::oneshot;
+use tracing::{error, info};
 
 use super::envelope::{Envelope, MessageType, METHOD_HELLO};
 
@@ -21,7 +22,7 @@ type HandlerFuture = Pin<Box<dyn Future<Output = Envelope> + Send>>;
 pub type MethodHandler = Arc<dyn Fn(Envelope) -> HandlerFuture + Send + Sync>;
 
 pub struct PluginClient {
-    write: Arc<Mutex<OwnedWriteHalf>>,
+    write: Arc<AsyncMutex<OwnedWriteHalf>>,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Envelope>>>>,
     handlers: Arc<Mutex<HashMap<String, MethodHandler>>>,
     request_id: Arc<AtomicI64>,
@@ -44,7 +45,7 @@ impl PluginClient {
         let request_id = Arc::new(AtomicI64::new(0));
 
         let client = PluginClient {
-            write: Arc::new(Mutex::new(write)),
+            write: Arc::new(AsyncMutex::new(write)),
             pending: pending.clone(),
             handlers: handlers.clone(),
             request_id: request_id.clone(),
@@ -126,7 +127,7 @@ impl PluginClient {
     }
 }
 
-async fn send_frame(write: &Arc<Mutex<OwnedWriteHalf>>, envelope: &Envelope) -> anyhow::Result<()> {
+async fn send_frame(write: &Arc<AsyncMutex<OwnedWriteHalf>>, envelope: &Envelope) -> anyhow::Result<()> {
     let payload = rmp_serde::to_vec(envelope).context("msgpack encode envelope")?;
     let mut guard = write.lock().await;
     guard
@@ -140,7 +141,7 @@ async fn send_frame(write: &Arc<Mutex<OwnedWriteHalf>>, envelope: &Envelope) -> 
 /// 读循环：分派 response / request / broadcast（对齐 _recv_loop）。
 async fn recv_loop(
     mut read: OwnedReadHalf,
-    write: Arc<Mutex<OwnedWriteHalf>>,
+    write: Arc<AsyncMutex<OwnedWriteHalf>>,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Envelope>>>>,
     handlers: Arc<Mutex<HashMap<String, MethodHandler>>>,
 ) {
@@ -175,6 +176,7 @@ async fn recv_loop(
                 }
                 continue;
             };
+            let write = write.clone();
             tokio::spawn(async move {
                 let response = handler(envelope).await;
                 if let Err(e) = send_frame(&write, &response).await {

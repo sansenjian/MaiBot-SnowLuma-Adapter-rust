@@ -7,7 +7,8 @@
 
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
-use tokio::time::{Instant, Reverse};
+use std::cmp::Reverse;
+use tokio::time::Instant;
 
 /// 与 Python 版默认参数一致：TTL 300s，最大 10000 条。
 pub const DEFAULT_TTL: Duration = Duration::from_secs(300);

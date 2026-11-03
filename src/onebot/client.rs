@@ -41,36 +41,39 @@ pub async fn run(
                     backoff = config.reconnect_min_interval;
                     let (mut write, mut read) = ws.split();
 
-                    let mut writer = tokio::spawn(async move {
-                        while let Some(frame) = action_rx.recv().await {
-                            if write.send(frame.to_string().into()).await.is_err() {
-                                warn!("napcat ws send failed, writer exiting");
-                                break;
-                            }
-                        }
-                    });
-
-                    while let Some(msg) = read.next().await {
-                        match msg {
-                            Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                                if event_tx.send(text).await.is_err() {
-                                    warn!("event receiver dropped, exiting client loop");
-                                    writer.abort();
-                                    return Ok(());
+                    loop {
+                        tokio::select! {
+                            msg = read.next() => {
+                                match msg {
+                                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                                        if event_tx.send(text).await.is_err() {
+                                            warn!("event receiver dropped, exiting client loop");
+                                            return Ok(());
+                                        }
+                                    }
+                                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => {
+                                        warn!("napcat closed the connection");
+                                        break;
+                                    }
+                                    Some(Err(e)) => {
+                                        error!(error = %e, "websocket error");
+                                        break;
+                                    }
+                                    _ => {}
                                 }
                             }
-                            Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                                warn!("napcat closed the connection");
-                                break;
+                            frame = action_rx.recv() => {
+                                let Some(frame) = frame else {
+                                    warn!("action channel closed, exiting client loop");
+                                    return Ok(());
+                                };
+                                if write.send(frame.to_string().into()).await.is_err() {
+                                    warn!("napcat ws send failed");
+                                    break;
+                                }
                             }
-                            Err(e) => {
-                                error!(error = %e, "websocket error");
-                                break;
-                            }
-                            _ => {}
                         }
                     }
-                    writer.abort();
                 }
                 Err(e) => {
                     error!(error = %e, "connect to napcat failed");
