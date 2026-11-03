@@ -162,7 +162,10 @@ async fn convert_segments(segments: &[Value], ctx: &SegmentContext<'_>) -> (Vec<
                     out.push(json!({ "type": "reply", "data": build_reply_data(&target, ctx).await }));
                 }
             }
-            "face" => out.push(text_segment("[表情]")),
+            "face" => {
+                let id = py_str(data.get("id")).trim().to_owned();
+                out.push(text_segment(&crate::face::face_text(&id)));
+            }
             "image" => {
                 let url = py_str(data.get("url")).trim().to_owned();
                 // 对齐 Python：subType ∉ {0,4,9} 视为表情
@@ -464,7 +467,10 @@ fn convert_segments_inline(segments: &[Value]) -> Vec<Value> {
                     out.push(json!({ "type": "reply", "data": { "target_message_id": target } }));
                 }
             }
-            "face" => out.push(text_segment("[表情]")),
+            "face" => {
+                let id = py_str(data.get("id")).trim().to_owned();
+                out.push(text_segment(&crate::face::face_text(&id)));
+            }
             "image" => {
                 let url = py_str(data.get("url")).trim().to_owned();
                 out.push(if !url.is_empty() {

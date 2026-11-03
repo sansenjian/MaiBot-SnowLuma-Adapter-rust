@@ -1,5 +1,6 @@
 mod config;
 mod dedupe;
+mod face;
 mod inbound;
 mod message;
 mod onebot;
