@@ -57,6 +57,14 @@ pub async fn run(
                                             return Ok(());
                                         }
                                     }
+                                    // WS 协议层 ping 必须回 pong，否则服务端（websockets/SnowLuma）
+                                    // 会在 ping 超时后断开连接（实测约 20-30s）
+                                    Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
+                                        if write.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.is_err() {
+                                            warn!("pong send failed");
+                                            break;
+                                        }
+                                    }
                                     Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => {
                                         warn!("napcat closed the connection");
                                         break;

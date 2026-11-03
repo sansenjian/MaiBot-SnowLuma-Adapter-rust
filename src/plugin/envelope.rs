@@ -136,11 +136,14 @@ mod tests {
         let env = Envelope::new_request(1, METHOD_HELLO, "", serde_json::json!({
             "runner_id": "r1", "sdk_version": "1.0.0", "session_token": "t"
         }));
-        let bytes = rmp_serde::to_vec(&env).unwrap();
-        let back: Envelope = rmp_serde::from_slice(&bytes).unwrap();
+        let bytes = rmp_serde::to_vec(&serde_json::to_value(&env).unwrap()).unwrap();
+        // Python 侧按 dict 取值：必须是字段名映射（map），不能是数组
+        let raw: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(raw.is_object(), "envelope 必须是 msgpack map");
+        assert_eq!(raw["protocol_version"], serde_json::json!("1.0.0"));
+        assert_eq!(raw["method"], serde_json::json!(METHOD_HELLO));
+        let back: Envelope = serde_json::from_value(raw).unwrap();
         assert_eq!(back.request_id, 1);
-        assert_eq!(back.method, METHOD_HELLO);
-        assert_eq!(back.protocol_version, "1.0.0");
         assert_eq!(back.payload["runner_id"], serde_json::json!("r1"));
     }
 

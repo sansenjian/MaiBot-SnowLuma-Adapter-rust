@@ -128,7 +128,10 @@ impl PluginClient {
 }
 
 async fn send_frame(write: &Arc<AsyncMutex<OwnedWriteHalf>>, envelope: &Envelope) -> anyhow::Result<()> {
-    let payload = rmp_serde::to_vec(envelope).context("msgpack encode envelope")?;
+    // 对齐 Python Envelope（msgpack dict）：rmp-serde 默认把 struct 编成数组，
+    // 必须经 serde_json::Value 中转保证字段名映射（Python 侧 dict["method"] 取值）。
+    let value = serde_json::to_value(envelope).context("envelope to json value")?;
+    let payload = rmp_serde::to_vec(&value).context("msgpack encode envelope")?;
     let mut guard = write.lock().await;
     guard
         .write_u32(payload.len() as u32)

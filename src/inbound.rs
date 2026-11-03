@@ -306,10 +306,15 @@ async fn resolve_at_target(target: &str, ctx: &SegmentContext<'_>) -> Option<(Op
         .ok()?
         .ok()?;
     let obj = data.as_object()?;
-    let nickname = obj.get("card").and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| obj.get("nickname").and_then(Value::as_str))
-        .map(|s| s.trim().to_owned());
+    // 与 user_info 同一规则：nickname 优先，card 仅作 cardname
+    let nickname = obj.get("nickname").and_then(Value::as_str)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            obj.get("card").and_then(Value::as_str)
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        });
     let cardname = obj.get("card").and_then(Value::as_str)
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());

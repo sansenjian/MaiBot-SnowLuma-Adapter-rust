@@ -11,7 +11,7 @@ mod upstream;
 
 use config::UpstreamMode;
 use serde_json::{json, Value};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// 端到端管线：
 /// NapCat --(OneBot WS)--> onebot::client --原始JSON--> 入站转换(MessageBase) --> 上行 --> Core
@@ -79,60 +79,96 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 入站管线：NapCat 事件 → 转换 → （socketio 模式本地去重）→ Core
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .ok();
-
-    let mut deduper = dedupe::Deduper::new(dedupe::DEFAULT_TTL, dedupe::DEFAULT_MAX_ENTRIES)?;
-    while let Some(raw) = event_rx.recv().await {
-        let parsed: Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, raw = %raw, "invalid json frame");
+    // ---- 事件分派协程：只解析帧并立刻分类 ----
+    // 关键：回执必须在此立即 resolve_receipt，绝不能和入站转换在同一个循环里 await
+    // ——convert_event 会 await 查询回执，若同循环会自死锁（等自己读的帧）。
+    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<Value>(1024);
+    let api_dispatch = api.clone();
+    tokio::spawn(async move {
+        while let Some(raw) = event_rx.recv().await {
+            let parsed: Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, raw = %raw, "invalid json frame");
+                    continue;
+                }
+            };
+            // API 回执（带 echo）：优先喂给查询等待方，未匹配的记为出站回执
+            if parsed.get("echo").is_some() && parsed.get("status").is_some() {
+                if api_dispatch.resolve_receipt(&parsed) {
+                    debug!("onebot api receipt (query resolved)");
+                } else {
+                    let actual_id = parsed
+                        .pointer("/data/message_id")
+                        .or(parsed.pointer("/data/data/message_id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    info!(echo = ?parsed.get("echo"), message_id = %actual_id, "outbound message sent");
+                }
                 continue;
             }
-        };
-        // API 回执（带 echo）：优先喂给查询等待方，未匹配的记日志（出站追踪 TODO）
-        if parsed.get("echo").is_some() && parsed.get("status").is_some() {
-            if api.resolve_receipt(&parsed) {
-                debug!("onebot api receipt (query resolved)");
-            } else {
-                // 出站回执：记录平台实际 message_id（出站追踪的数据基础）
-                let actual_id = parsed
-                    .pointer("/data/message_id")
-                    .or(parsed.pointer("/data/data/message_id"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                info!(echo = ?parsed.get("echo"), message_id = %actual_id, "outbound message sent");
+            if parsed.get("post_type").and_then(Value::as_str) != Some("message") {
+                debug!(post_type = ?parsed.get("post_type"), "non-message event ignored");
+                continue;
             }
-            continue;
+            if inbound_tx.send(parsed).await.is_err() {
+                break;
+            }
         }
-        if parsed.get("post_type").and_then(Value::as_str) != Some("message") {
-            debug!(post_type = ?parsed.get("post_type"), "non-message event ignored");
-            continue;
-        }
-        match inbound::convert_event(&parsed, &config.platform_name, Some(&api), http.as_ref()).await {
-            Ok(converted) => {
-                if config.upstream_mode == UpstreamMode::Socketio {
-                    // 对齐 Core manager.py：dedupe_key = f"{driver_id}:{message_id}"
-                    let dedupe_key = format!("{}:{}", config.driver_id, converted.message_id);
-                    if !deduper.mark_seen(&dedupe_key) {
-                        info!(dedupe_key = %dedupe_key, "duplicate message dropped");
-                        continue;
+    });
+
+    // ---- 入站转换协程：可安全 await NapCat 查询回执（回执由分派协程并发处理）----
+    let api_convert = api.clone();
+    let config_convert = config.clone();
+    let emit_tx = core_emit_tx.clone();
+    tokio::spawn(async move {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .ok();
+        let mut deduper: Option<dedupe::Deduper> =
+            match dedupe::Deduper::new(dedupe::DEFAULT_TTL, dedupe::DEFAULT_MAX_ENTRIES) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    error!(error = %e, "deduper init failed, dedupe disabled");
+                    None
+                }
+            };
+        while let Some(parsed) = inbound_rx.recv().await {
+            match inbound::convert_event(
+                &parsed,
+                &config_convert.platform_name,
+                Some(&api_convert),
+                http.as_ref(),
+            )
+            .await
+            {
+                Ok(converted) => {
+                    if config_convert.upstream_mode == UpstreamMode::Socketio {
+                        // 对齐 Core manager.py：dedupe_key = f"{driver_id}:{message_id}"
+                        let dedupe_key =
+                            format!("{}:{}", config_convert.driver_id, converted.message_id);
+                        if let Some(d) = deduper.as_mut() {
+                            if !d.mark_seen(&dedupe_key) {
+                                info!(dedupe_key = %dedupe_key, "duplicate message dropped");
+                                continue;
+                            }
+                        }
+                    }
+                    if emit_tx.send(converted.message).await.is_err() {
+                        warn!("core emit channel closed");
+                        break;
                     }
                 }
-                if core_emit_tx.send(converted.message).await.is_err() {
-                    warn!("core emit channel closed");
-                    break;
+                Err(e) => {
+                    warn!(error = %e, raw = %parsed, "inbound convert failed");
                 }
             }
-            Err(e) => {
-                warn!(error = %e, raw = %raw, "inbound convert failed");
-            }
         }
-    }
+    });
+
+    // 主线程保持存活（Ctrl-C 优雅退出）
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
