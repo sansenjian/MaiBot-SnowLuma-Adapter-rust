@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
     // NapCat 侧
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<String>(1024);
     let (action_tx, action_rx) = tokio::sync::mpsc::channel::<Value>(256);
+    let api = onebot::api::ApiClient::new(action_tx.clone());
     tokio::spawn(onebot::client::run(config.clone(), event_tx, action_rx));
 
     // Core 侧
@@ -35,19 +36,18 @@ async fn main() -> anyhow::Result<()> {
     let (core_recv_tx, mut core_recv_rx) = tokio::sync::mpsc::channel::<Value>(256);
     tokio::spawn(upstream::run(config.clone(), core_emit_rx, core_recv_tx));
 
-    // 出站管线：Core 下发 → 编码 OneBot 动作 → NapCat
+    // 出站管线：Core 下发 → 编码 OneBot 动作 → NapCat（echo 与查询共用计数器）
     let action_tx_out = action_tx.clone();
+    let api_out = api.clone();
     tokio::spawn(async move {
-        let mut echo: u64 = 0;
         while let Some(msg) = core_recv_rx.recv().await {
             let proxy = to_outbound_shape(&msg);
             match outbound::build_outbound_action(&proxy, &json!({})) {
                 Ok(action) => {
-                    echo += 1;
                     let frame = json!({
                         "action": action.action,
                         "params": action.params,
-                        "echo": echo,
+                        "echo": api_out.next_echo(),
                     });
                     if action_tx_out.send(frame).await.is_err() {
                         warn!("onebot action channel closed");
@@ -74,16 +74,20 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
-        // API 回执（带 echo），v1 仅记录日志（出站追踪 TODO）
+        // API 回执（带 echo）：优先喂给查询等待方，未匹配的记日志（出站追踪 TODO）
         if parsed.get("echo").is_some() && parsed.get("status").is_some() {
-            debug!(receipt = %parsed, "onebot api receipt");
+            if api.resolve_receipt(&parsed) {
+                debug!("onebot api receipt (query resolved)");
+            } else {
+                debug!(receipt = %parsed, "onebot api receipt (untracked)");
+            }
             continue;
         }
         if parsed.get("post_type").and_then(Value::as_str) != Some("message") {
             debug!(post_type = ?parsed.get("post_type"), "non-message event ignored");
             continue;
         }
-        match inbound::convert_event(&parsed, &config.platform_name) {
+        match inbound::convert_event(&parsed, &config.platform_name, Some(&api)).await {
             Ok(converted) => {
                 // 对齐 Core manager.py：dedupe_key = f"{driver_id}:{message_id}"
                 let dedupe_key = format!("{}:{}", config.driver_id, converted.message_id);

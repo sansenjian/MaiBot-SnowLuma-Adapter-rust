@@ -34,21 +34,19 @@ cargo run --release  # 生产（LTO）
 ## 已实现
 
 - NapCat 正向 WS（Bearer token 头、指数退避重连、出站动作写任务 + echo 计数）
-- 入站：OneBot message 事件 → MessageBase（纯同步子集，见下）
+- NapCat API 查询客户端（echo 回执关联，5s 超时）
+- 入站：OneBot message 事件 → MessageBase；at 昵称解析（get_group_member_info/get_stranger_info）、reply 被引预览（get_msg）、forward 查询（get_forward_msg，失败降级）
 - 去重：`{driver_id}:{message_id}`，TTL 300s / 上限 10000
 - 上行：socket.io client（platform/Authorization 头、单事件 `message`、重连退避）
 - 出站：MessageBase/MessageDict 统一 → OneBot send_* 动作（16 类段映射 + forward 打包）
 
-## 已知差距（v1，行为对齐待办）
+## 已知差距（v2，行为对齐待办）
 
-1. at 段昵称解析（需 NapCat get_group_member_info/get_stranger_info 查询通道）
-2. reply 段被引消息预览（需 get_msg 查询）
-3. 图片/语音下载转 base64（当前直接用 url，MessageBase 惯例可接受）
-4. forward 段 get_forward_msg 查询（无内联节点时降级为 `[forward]` 文本）
-5. QQ_FACE 表情表（当前统一 `[表情]`）
-6. echo 回执仅记日志，未与发送方关联（出站追踪）
-7. 非 message 事件（notice/request/meta_event）直接忽略
-8. rust-socketio API 版本差异可能导致编译需微调（`connect().await`、Payload 变体）
+1. 图片/语音下载转 base64（当前 image/voice 段直接用 url，MessageBase 惯例可接受）
+2. QQ_FACE 表情表（当前统一 `[表情]`）
+3. echo 回执仅记日志，未与发送方关联（出站追踪）
+4. 非 message 事件（notice/request/meta_event）直接忽略
+5. rust-socketio API 版本差异可能导致编译需微调（`connect().await`、Payload 变体）
 
 ## 验收对照
 

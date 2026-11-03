@@ -1,15 +1,20 @@
 //! 入站转换器：OneBot v11 `message` 事件 → maim_message `MessageBase`（方案 A 上行载荷）。
 //!
-//! 对齐 Adapter codecs/inbound/message_codec.py 的**纯同步子集**。以下依赖 NapCat
-//! 查询 API 的增强 v1 未实现，属于已知行为差异（待 query client 就绪后补齐）：
-//! - at 段昵称解析（get_group_member_info / get_stranger_info）→ nickname/cardname 留空
-//! - reply 段被引消息预览（get_msg）→ 仅保留 target_message_id
-//! - 图片/语音二进制下载转 base64 → image/voice 段直接使用 url（MessageBase 惯例即 url）
-//! - forward 段 get_forward_msg 查询 → 无内联节点时降级为 "[forward]" 文本
-//! - QQ_FACE 表情表 → 统一输出 "[表情]"
+//! 对齐 Adapter codecs/inbound/message_codec.py。v2 起在有 ApiClient 时补齐以下
+//! 依赖 NapCat 查询 API 的增强（单查询 5s 超时，失败按 Python 版语义降级）：
+//! - at 段昵称解析（get_group_member_info / get_stranger_info）
+//! - reply 段被引消息预览（get_msg）
+//! - forward 段 get_forward_msg 查询（无内联节点时）
+//!
+//! 仍未实现（已知差距）：图片/语音二进制下载转 base64（当前直接用 url）、
+//! QQ_FACE 表情表（统一输出 "[表情]"）。
 
 use anyhow::Context;
 use serde_json::{json, Value};
+
+use crate::onebot::api::ApiClient;
+
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct InboundMessage {
     /// MessageBase 字典（可直接经 socket.io 发往 Core）
@@ -18,23 +23,33 @@ pub struct InboundMessage {
     pub message_id: String,
 }
 
-pub fn convert_event(event: &Value, platform: &str) -> anyhow::Result<InboundMessage> {
-    let obj = event
-        .as_object()
-        .context("OneBot 事件不是 JSON object")?;
+pub async fn convert_event(
+    event: &Value,
+    platform: &str,
+    api: Option<&ApiClient>,
+) -> anyhow::Result<InboundMessage> {
+    let obj = event.as_object().context("OneBot 事件不是 JSON object")?;
 
     let segments = obj
         .get("message")
         .and_then(Value::as_array)
         .context("OneBot 事件缺少结构化 message 段列表")?;
     let self_id = py_str(obj.get("self_id"));
-    let (converted, is_at) = convert_segments(segments, &self_id);
 
-    let message_id = py_str(obj.get("message_id"))
-        .trim()
-        .to_owned();
+    let group_id_raw = py_str(obj.get("group_id")).trim().to_owned();
+    let is_group = !group_id_raw.is_empty();
+    let group_id_num: Option<i64> = group_id_raw.parse().ok();
+
+    let ctx = SegmentContext {
+        self_id: self_id.trim().to_owned(),
+        is_group,
+        group_id_num,
+        api,
+    };
+    let (converted, is_at) = convert_segments(segments, &ctx).await;
+
+    let message_id = py_str(obj.get("message_id")).trim().to_owned();
     let message_id = if message_id.is_empty() {
-        // 对齐 Python 的 napcat-<uuid4> 回退；v1 用时间戳+自增近似
         format!("napcat-{}", now_millis())
     } else {
         message_id
@@ -45,40 +60,33 @@ pub fn convert_event(event: &Value, platform: &str) -> anyhow::Result<InboundMes
         .and_then(|v| v.as_f64())
         .unwrap_or_else(|| now_millis() as f64 / 1000.0);
 
-    // user_info：nickname 取 sender.nickname ?? sender.card ?? user_id；cardname 取 sender.card
-    let sender = obj.get("sender").and_then(Value::as_object).cloned().unwrap_or_default();
+    let sender = obj
+        .get("sender")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let user_id = py_str(obj.get("user_id")).trim().to_owned();
     let cardname = py_str(sender.get("card")).trim().to_owned();
-    let nickname = py_str(sender.get("nickname"))
-        .trim()
-        .to_owned();
-    let nickname = if nickname.is_empty() {
-        cardname.clone()
-    } else {
-        nickname
+    let nickname = {
+        let n = py_str(sender.get("nickname")).trim().to_owned();
+        if n.is_empty() { cardname.clone() } else { n }
     };
     let nickname = if nickname.is_empty() { user_id.clone() } else { nickname };
 
-    let mut user_info = json!({
-        "platform": platform,
-        "user_id": user_id,
-        "user_nickname": nickname,
-    });
+    let mut user_info = json!({ "platform": platform, "user_id": user_id, "user_nickname": nickname });
     if !cardname.is_empty() {
         user_info["user_cardname"] = json!(cardname);
     }
 
-    let group_id = py_str(obj.get("group_id")).trim().to_owned();
     let group_name = py_str(obj.get("group_name")).trim().to_owned();
-
     let mut message_info = json!({
         "platform": platform,
         "message_id": message_id,
         "time": time,
         "user_info": user_info,
     });
-    if !group_id.is_empty() {
-        let mut gi = json!({"platform": platform, "group_id": group_id});
+    if is_group {
+        let mut gi = json!({ "platform": platform, "group_id": group_id_raw });
         if !group_name.is_empty() {
             gi["group_name"] = json!(group_name);
         }
@@ -87,21 +95,24 @@ pub fn convert_event(event: &Value, platform: &str) -> anyhow::Result<InboundMes
 
     let message_segment = match converted.len() {
         1 => converted.into_iter().next().unwrap(),
-        _ => json!({"type": "seglist", "data": converted}),
+        _ => json!({ "type": "seglist", "data": converted }),
     };
 
     let _ = is_at; // MessageBase 形态不携带 is_at，Core 自行从 seglist 检测
     Ok(InboundMessage {
-        message: json!({
-            "message_info": message_info,
-            "message_segment": message_segment,
-        }),
+        message: json!({ "message_info": message_info, "message_segment": message_segment }),
         message_id,
     })
 }
 
-/// 对齐 _convert_incoming_segments 的同步子集，返回 (Host 段列表, 是否 at 到本机器人)。
-fn convert_segments(segments: &[Value], self_id: &str) -> (Vec<Value>, bool) {
+struct SegmentContext<'a> {
+    self_id: String,
+    is_group: bool,
+    group_id_num: Option<i64>,
+    api: Option<&'a ApiClient>,
+}
+
+async fn convert_segments(segments: &[Value], ctx: &SegmentContext<'_>) -> (Vec<Value>, bool) {
     let mut out = Vec::new();
     let mut is_at = false;
     for segment in segments {
@@ -121,11 +132,17 @@ fn convert_segments(segments: &[Value], self_id: &str) -> (Vec<Value>, bool) {
             "at" => {
                 let target = py_str(data.get("qq")).trim().to_owned();
                 if !target.is_empty() {
-                    out.push(json!({
-                        "type": "at",
-                        "data": {"target_user_id": target}
-                    }));
-                    if !self_id.is_empty() && target == self_id {
+                    let mut d = json!({ "target_user_id": target });
+                    if let Some((nickname, cardname)) = resolve_at_target(&target, ctx).await {
+                        if let Some(n) = nickname {
+                            d["target_user_nickname"] = json!(n);
+                        }
+                        if let Some(c) = cardname {
+                            d["target_user_cardname"] = json!(c);
+                        }
+                    }
+                    out.push(json!({ "type": "at", "data": d }));
+                    if !ctx.self_id.is_empty() && target == ctx.self_id {
                         is_at = true;
                     }
                 }
@@ -133,17 +150,14 @@ fn convert_segments(segments: &[Value], self_id: &str) -> (Vec<Value>, bool) {
             "reply" => {
                 let target = py_str(data.get("id")).trim().to_owned();
                 if !target.is_empty() {
-                    out.push(json!({
-                        "type": "reply",
-                        "data": {"target_message_id": target}
-                    }));
+                    out.push(json!({ "type": "reply", "data": build_reply_data(&target, ctx).await }));
                 }
             }
             "face" => out.push(text_segment("[表情]")),
             "image" => {
                 let url = py_str(data.get("url")).trim().to_owned();
                 if !url.is_empty() {
-                    out.push(json!({"type": "image", "data": url}));
+                    out.push(json!({ "type": "image", "data": url }));
                 } else {
                     out.push(text_segment("[image]"));
                 }
@@ -151,7 +165,7 @@ fn convert_segments(segments: &[Value], self_id: &str) -> (Vec<Value>, bool) {
             "record" => {
                 let url = py_str(data.get("url")).trim().to_owned();
                 if !url.is_empty() {
-                    out.push(json!({"type": "voice", "data": url}));
+                    out.push(json!({ "type": "voice", "data": url }));
                 } else {
                     out.push(text_segment("[voice]"));
                 }
@@ -193,16 +207,18 @@ fn convert_segments(segments: &[Value], self_id: &str) -> (Vec<Value>, bool) {
                 out.push(text_segment(&text));
             }
             "forward" => {
-                if let Some(nodes) = extract_forward_messages(&data) {
-                    let converted_nodes = convert_forward_nodes(nodes);
-                    if converted_nodes.is_empty() {
-                        out.push(text_segment("[forward]"));
-                    } else {
-                        out.push(json!({"type": "forward", "data": converted_nodes}));
-                    }
+                let nodes = if let Some(inline) = extract_forward_messages(&data) {
+                    Some(inline.clone())
+                } else if let Some(id) = data.get("id").and_then(Value::as_str) {
+                    query_forward_nodes(id, ctx).await
                 } else {
-                    // v1 未实现 get_forward_msg 查询
-                    out.push(text_segment("[forward]"));
+                    None
+                };
+                match nodes {
+                    Some(nodes) if !nodes.is_empty() => {
+                        out.push(json!({ "type": "forward", "data": convert_forward_nodes(&nodes) }))
+                    }
+                    _ => out.push(text_segment("[forward]")),
                 }
             }
             "xml" | "share" => out.push(text_segment(&format!("[{seg_type}]"))),
@@ -215,6 +231,90 @@ fn convert_segments(segments: &[Value], self_id: &str) -> (Vec<Value>, bool) {
     (out, is_at)
 }
 
+/// 对齐 Python 版 at 昵称解析：群消息 get_group_member_info，私聊 get_stranger_info。
+/// 查询失败返回 None（Python 版同样降级为不带昵称的 at 段）。
+async fn resolve_at_target(target: &str, ctx: &SegmentContext<'_>) -> Option<(Option<String>, Option<String>)> {
+    let api = ctx.api?;
+    let user_id: i64 = target.parse().ok()?;
+    let params = match (ctx.is_group, ctx.group_id_num) {
+        (true, Some(gid)) => json!({ "group_id": gid, "user_id": user_id }),
+        _ => json!({ "user_id": user_id }),
+    };
+    let action = if ctx.is_group { "get_group_member_info" } else { "get_stranger_info" };
+    let data = tokio::time::timeout(QUERY_TIMEOUT, api.call(action, params))
+        .await
+        .ok()?
+        .ok()?;
+    let obj = data.as_object()?;
+    let nickname = obj.get("card").and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| obj.get("nickname").and_then(Value::as_str))
+        .map(|s| s.trim().to_owned());
+    let cardname = obj.get("card").and_then(Value::as_str)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    Some((nickname, cardname))
+}
+
+/// 对齐 reply 段被引消息预览：get_msg 提取文本摘要与发送者信息，失败降级为仅 id。
+async fn build_reply_data(target_id: &str, ctx: &SegmentContext<'_>) -> Value {
+    let mut d = json!({ "target_message_id": target_id });
+    let Some(api) = ctx.api else { return d };
+    let Ok(Ok(data)) = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        api.call("get_msg", json!({ "message_id": target_id })),
+    )
+    .await
+    else {
+        return d;
+    };
+    if let Some(content) = data.get("message").and_then(Value::as_array) {
+        let preview: String = content
+            .iter()
+            .filter_map(|s| s.get("data")?.get("text")?.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let preview = preview.trim().to_owned();
+        if !preview.is_empty() {
+            d["target_message_content"] = json!(preview);
+        }
+    }
+    if let Some(sender) = data.get("sender").and_then(Value::as_object) {
+        if let Some(uid) = sender.get("user_id") {
+            d["target_sender_user_id"] = json!(py_str(Some(uid)));
+        }
+        let nickname = sender
+            .get("nickname")
+            .and_then(Value::as_str)
+            .map(|s| s.to_owned())
+            .unwrap_or_default();
+        if !nickname.is_empty() {
+            d["target_sender_nickname"] = json!(nickname);
+        }
+        let card = sender.get("card").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+        if !card.is_empty() {
+            d["target_sender_cardname"] = json!(card);
+        }
+    }
+    d
+}
+
+/// 对齐 forward 段 get_forward_msg 查询；失败返回 None（降级 [forward] 文本）。
+async fn query_forward_nodes(id: &str, ctx: &SegmentContext<'_>) -> Option<Vec<Value>> {
+    let api = ctx.api?;
+    let data = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        api.call("get_forward_msg", json!({ "id": id })),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    data.get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| data.get("content").and_then(Value::as_array).cloned())
+}
+
 /// 对齐 _extract_forward_messages：优先内联 messages/content（不查 API）。
 fn extract_forward_messages(data: &serde_json::Map<String, Value>) -> Option<&Vec<Value>> {
     data.get("messages")
@@ -222,7 +322,7 @@ fn extract_forward_messages(data: &serde_json::Map<String, Value>) -> Option<&Ve
         .or_else(|| data.get("content").and_then(Value::as_array))
 }
 
-/// 对齐 _build_forward_nodes（内联节点的同步转换）。
+/// 对齐 _build_forward_nodes。
 fn convert_forward_nodes(nodes: &[Value]) -> Vec<Value> {
     let mut out = Vec::new();
     for node in nodes {
@@ -244,12 +344,13 @@ fn convert_forward_nodes(nodes: &[Value]) -> Vec<Value> {
         ]);
         let cardname = first_non_empty(&[sender.get("card").or(node_data.get("card"))]);
         let message_id = first_non_empty(&[m.get("message_id")]);
-        let content = m
+        // 内联节点的 content 可能出现在节点 data.content（嵌套一层）
+        let content_arr = m
             .get("content")
+            .or(node_data.get("content"))
             .or(m.get("message"))
-            .and_then(Value::as_array)
-            .map(|c| convert_segments(c, "").0)
-            .unwrap_or_default();
+            .and_then(Value::as_array);
+        let content = content_arr.map(convert_segments_inline).unwrap_or_default();
 
         let mut n = json!({
             "user_nickname": if nickname.is_empty() { "未知用户" } else { nickname },
@@ -267,8 +368,78 @@ fn convert_forward_nodes(nodes: &[Value]) -> Vec<Value> {
     out
 }
 
+/// 内联 forward 节点的同步转换子集：不发起任何 NapCat 查询
+///（at 不带昵称、reply 仅 id、forward 仅内联递归），与 Python 版在无 API
+/// 上下文时的降级行为一致。递归出现在同步函数中，无 async 递归问题。
+fn convert_segments_inline(segments: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for segment in segments {
+        let Some(seg) = segment.as_object() else { continue };
+        let seg_type = py_str(seg.get("type")).trim().to_owned();
+        let data = match seg.get("data") {
+            Some(Value::Object(m)) => m.clone(),
+            _ => serde_json::Map::new(),
+        };
+        match seg_type.as_str() {
+            "text" => {
+                let text = py_str(data.get("text"));
+                if !text.is_empty() {
+                    out.push(text_segment(&text));
+                }
+            }
+            "at" => {
+                let target = py_str(data.get("qq")).trim().to_owned();
+                if !target.is_empty() {
+                    out.push(json!({ "type": "at", "data": { "target_user_id": target } }));
+                }
+            }
+            "reply" => {
+                let target = py_str(data.get("id")).trim().to_owned();
+                if !target.is_empty() {
+                    out.push(json!({ "type": "reply", "data": { "target_message_id": target } }));
+                }
+            }
+            "face" => out.push(text_segment("[表情]")),
+            "image" => {
+                let url = py_str(data.get("url")).trim().to_owned();
+                out.push(if !url.is_empty() {
+                    json!({ "type": "image", "data": url })
+                } else {
+                    text_segment("[image]")
+                });
+            }
+            "record" => {
+                let url = py_str(data.get("url")).trim().to_owned();
+                out.push(if !url.is_empty() {
+                    json!({ "type": "voice", "data": url })
+                } else {
+                    text_segment("[voice]")
+                });
+            }
+            "video" | "file" | "xml" | "share" => out.push(text_segment(&format!("[{seg_type}]"))),
+            "forward" => {
+                if let Some(nodes) = extract_forward_messages(&data) {
+                    let converted = convert_forward_nodes(nodes);
+                    if converted.is_empty() {
+                        out.push(text_segment("[forward]"));
+                    } else {
+                        out.push(json!({ "type": "forward", "data": converted }));
+                    }
+                } else {
+                    out.push(text_segment("[forward]"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        out.push(text_segment("[empty]"));
+    }
+    out
+}
+
 fn text_segment(text: &str) -> Value {
-    json!({"type": "text", "data": text})
+    json!({ "type": "text", "data": text })
 }
 
 fn py_str(v: Option<&Value>) -> String {
@@ -304,8 +475,8 @@ fn now_millis() -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn group_message_with_at() {
+    #[tokio::test]
+    async fn group_message_with_at() {
         let event = json!({
             "time": 1700000000.0,
             "self_id": 100,
@@ -320,7 +491,7 @@ mod tests {
                 {"type": "at", "data": {"qq": "100"}}
             ]
         });
-        let out = convert_event(&event, "qq").unwrap();
+        let out = convert_event(&event, "qq", None).await.unwrap();
         assert_eq!(out.message_id, "12345");
         let info = &out.message["message_info"];
         assert_eq!(info["group_info"]["group_id"], json!("888"));
@@ -331,8 +502,8 @@ mod tests {
         assert_eq!(seg["data"][1]["data"]["target_user_id"], json!("100"));
     }
 
-    #[test]
-    fn private_single_text_flattens() {
+    #[tokio::test]
+    async fn private_single_text_flattens() {
         let event = json!({
             "time": 1.0,
             "post_type": "message",
@@ -342,14 +513,33 @@ mod tests {
             "sender": {},
             "message": [{"type": "text", "data": {"text": "hi"}}]
         });
-        let out = convert_event(&event, "qq").unwrap();
+        let out = convert_event(&event, "qq", None).await.unwrap();
         assert_eq!(out.message["message_segment"]["type"], json!("text"));
         assert!(out.message["message_info"].get("group_info").is_none());
     }
 
-    #[test]
-    fn missing_message_field_errors() {
+    #[tokio::test]
+    async fn inline_forward_converted_without_api() {
+        let event = json!({
+            "time": 1.0, "post_type": "message", "message_id": 7, "user_id": 1,
+            "group_id": 2, "sender": {"nickname": "n"},
+            "message": [{
+                "type": "forward",
+                "data": {"messages": [
+                    {"sender": {"nickname": "甲"}, "content": [{"type": "text", "data": {"text": "内容"}}]}
+                ]}
+            }]
+        });
+        let out = convert_event(&event, "qq", None).await.unwrap();
+        let fwd = &out.message["message_segment"]["data"][0];
+        assert_eq!(fwd["type"], json!("forward"));
+        assert_eq!(fwd["data"][0]["user_nickname"], json!("甲"));
+        assert_eq!(fwd["data"][0]["content"][0]["data"], json!("内容"));
+    }
+
+    #[tokio::test]
+    async fn missing_message_field_errors() {
         let event = json!({"post_type": "message"});
-        assert!(convert_event(&event, "qq").is_err());
+        assert!(convert_event(&event, "qq", None).await.is_err());
     }
 }
