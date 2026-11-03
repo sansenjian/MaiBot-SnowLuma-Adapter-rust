@@ -3,7 +3,7 @@
 MaiBot（麦麦）的 Rust 消息网关，绞杀者模式逐步替换官方 Python 适配器进程。
 对协议端说 OneBot v11，对 MaiBot Core 说 plugin RPC（或 classic socket.io）。
 
-[![CI](https://github.com/sansenjian/maibot-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/sansenjian/maibot-rust/actions/workflows/ci.yml)
+[![CI](https://github.com/sansenjian/MaiBot-SnowLuma-Adapter-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/sansenjian/MaiBot-SnowLuma-Adapter-rust/actions/workflows/ci.yml)
 
 ```
 SnowLuma / NapCat (OneBot v11 WS) ⇄ maibot-rust ⇄ MaiBot Core
@@ -24,7 +24,7 @@ SnowLuma / NapCat (OneBot v11 WS) ⇄ maibot-rust ⇄ MaiBot Core
 ## 快速开始
 
 ```bash
-git clone https://github.com/sansenjian/maibot-rust.git
+git clone https://github.com/sansenjian/MaiBot-SnowLuma-Adapter-rust.git
 cd maibot-rust
 cargo build --release
 ```
