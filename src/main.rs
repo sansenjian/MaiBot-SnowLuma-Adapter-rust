@@ -76,6 +76,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 入站管线：NapCat 事件 → 转换 → （socketio 模式本地去重）→ Core
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok();
+
     let mut deduper = dedupe::Deduper::new(dedupe::DEFAULT_TTL, dedupe::DEFAULT_MAX_ENTRIES)?;
     while let Some(raw) = event_rx.recv().await {
         let parsed: Value = match serde_json::from_str(&raw) {
@@ -90,7 +95,13 @@ async fn main() -> anyhow::Result<()> {
             if api.resolve_receipt(&parsed) {
                 debug!("onebot api receipt (query resolved)");
             } else {
-                debug!(receipt = %parsed, "onebot api receipt (untracked)");
+                // 出站回执：记录平台实际 message_id（出站追踪的数据基础）
+                let actual_id = parsed
+                    .pointer("/data/message_id")
+                    .or(parsed.pointer("/data/data/message_id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                info!(echo = ?parsed.get("echo"), message_id = %actual_id, "outbound message sent");
             }
             continue;
         }
@@ -98,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
             debug!(post_type = ?parsed.get("post_type"), "non-message event ignored");
             continue;
         }
-        match inbound::convert_event(&parsed, &config.platform_name, Some(&api)).await {
+        match inbound::convert_event(&parsed, &config.platform_name, Some(&api), http.as_ref()).await {
             Ok(converted) => {
                 if config.upstream_mode == UpstreamMode::Socketio {
                     // 对齐 Core manager.py：dedupe_key = f"{driver_id}:{message_id}"

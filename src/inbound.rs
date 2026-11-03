@@ -15,6 +15,12 @@ use serde_json::{json, Value};
 use crate::onebot::api::ApiClient;
 
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn b64encode(bytes: &[u8]) -> String {
+    use base64::engine::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
 
 pub struct InboundMessage {
     /// MessageBase 字典（可直接经 socket.io 发往 Core）
@@ -27,6 +33,7 @@ pub async fn convert_event(
     event: &Value,
     platform: &str,
     api: Option<&ApiClient>,
+    http: Option<&reqwest::Client>,
 ) -> anyhow::Result<InboundMessage> {
     let obj = event.as_object().context("OneBot 事件不是 JSON object")?;
 
@@ -45,6 +52,7 @@ pub async fn convert_event(
         is_group,
         group_id_num,
         api,
+        http,
     };
     let (converted, is_at) = convert_segments(segments, &ctx).await;
 
@@ -110,6 +118,7 @@ struct SegmentContext<'a> {
     is_group: bool,
     group_id_num: Option<i64>,
     api: Option<&'a ApiClient>,
+    http: Option<&'a reqwest::Client>,
 }
 
 async fn convert_segments(segments: &[Value], ctx: &SegmentContext<'_>) -> (Vec<Value>, bool) {
@@ -156,18 +165,39 @@ async fn convert_segments(segments: &[Value], ctx: &SegmentContext<'_>) -> (Vec<
             "face" => out.push(text_segment("[表情]")),
             "image" => {
                 let url = py_str(data.get("url")).trim().to_owned();
+                // 对齐 Python：subType ∉ {0,4,9} 视为表情
+                let is_emoji = data
+                    .get("subType")
+                    .and_then(Value::as_i64)
+                    .map(|s| !(s == 0 || s == 4 || s == 9))
+                    .unwrap_or(false);
                 if !url.is_empty() {
-                    out.push(json!({ "type": "image", "data": url }));
+                    match download_base64(ctx.http, &url).await {
+                        Some(b64) => out.push(json!({
+                            "type": if is_emoji { "emoji" } else { "image" },
+                            "data": url,
+                            "binary_data_base64": b64,
+                        })),
+                        None => out.push(text_segment(if is_emoji { "[emoji]" } else { "[image]" })),
+                    }
                 } else {
-                    out.push(text_segment("[image]"));
+                    out.push(text_segment(if is_emoji { "[emoji]" } else { "[image]" }));
                 }
             }
             "record" => {
-                let url = py_str(data.get("url")).trim().to_owned();
-                if !url.is_empty() {
-                    out.push(json!({ "type": "voice", "data": url }));
+                let file = py_str(data.get("file")).trim().to_owned();
+                let b64 = if file.is_empty() {
+                    None
                 } else {
-                    out.push(text_segment("[voice]"));
+                    record_base64(&file, ctx).await
+                };
+                match b64 {
+                    Some(b64) if !b64.is_empty() => out.push(json!({
+                        "type": "voice",
+                        "data": file,
+                        "binary_data_base64": b64,
+                    })),
+                    _ => out.push(text_segment("[voice]")),
                 }
             }
             "video" => {
@@ -229,6 +259,36 @@ async fn convert_segments(segments: &[Value], ctx: &SegmentContext<'_>) -> (Vec<
         out.push(text_segment("[unsupported]"));
     }
     (out, is_at)
+}
+
+/// 下载图片二进制并转 base64（对齐 Python 的 url 下载）；失败返回 None。
+async fn download_base64(http: Option<&reqwest::Client>, url: &str) -> Option<String> {
+    let client = http?;
+    let resp = tokio::time::timeout(DOWNLOAD_TIMEOUT, client.get(url).send())
+        .await
+        .ok()?
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = tokio::time::timeout(DOWNLOAD_TIMEOUT, resp.bytes())
+        .await
+        .ok()?
+        .ok()?;
+    Some(b64encode(&bytes))
+}
+
+/// 对齐 Python record 段：get_record(file) 取 base64，失败返回 None。
+async fn record_base64(file: &str, ctx: &SegmentContext<'_>) -> Option<String> {
+    let api = ctx.api?;
+    let data = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        api.call("get_record", json!({ "file": file })),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    data.get("base64").and_then(Value::as_str).map(str::to_owned)
 }
 
 /// 对齐 Python 版 at 昵称解析：群消息 get_group_member_info，私聊 get_stranger_info。
@@ -491,7 +551,7 @@ mod tests {
                 {"type": "at", "data": {"qq": "100"}}
             ]
         });
-        let out = convert_event(&event, "qq", None).await.unwrap();
+        let out = convert_event(&event, "qq", None, None).await.unwrap();
         assert_eq!(out.message_id, "12345");
         let info = &out.message["message_info"];
         assert_eq!(info["group_info"]["group_id"], json!("888"));
@@ -513,7 +573,7 @@ mod tests {
             "sender": {},
             "message": [{"type": "text", "data": {"text": "hi"}}]
         });
-        let out = convert_event(&event, "qq", None).await.unwrap();
+        let out = convert_event(&event, "qq", None, None).await.unwrap();
         assert_eq!(out.message["message_segment"]["type"], json!("text"));
         assert!(out.message["message_info"].get("group_info").is_none());
     }
@@ -530,7 +590,7 @@ mod tests {
                 ]}
             }]
         });
-        let out = convert_event(&event, "qq", None).await.unwrap();
+        let out = convert_event(&event, "qq", None, None).await.unwrap();
         // 单段 flatten：message_segment 即 forward 段本身
         let fwd = &out.message["message_segment"];
         assert_eq!(fwd["type"], json!("forward"));
@@ -538,9 +598,15 @@ mod tests {
         assert_eq!(fwd["data"][0]["content"][0]["data"], json!("内容"));
     }
 
+    #[test]
+    fn b64encode_matches_standard() {
+        assert_eq!(b64encode(b"hello"), "aGVsbG8=");
+        assert_eq!(b64encode(b""), "");
+    }
+
     #[tokio::test]
     async fn missing_message_field_errors() {
         let event = json!({"post_type": "message"});
-        assert!(convert_event(&event, "qq", None).await.is_err());
+        assert!(convert_event(&event, "qq", None, None).await.is_err());
     }
 }
