@@ -7,10 +7,12 @@ mod outbound;
 mod plugin;
 mod profile;
 mod routing;
+mod sender;
 mod upstream;
 
 use config::UpstreamMode;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// 端到端管线：
@@ -36,54 +38,46 @@ async fn main() -> anyhow::Result<()> {
     // NapCat 侧
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<String>(1024);
     let (action_tx, action_rx) = tokio::sync::mpsc::channel::<Value>(256);
-    let api = onebot::api::ApiClient::new(action_tx.clone());
+    let api = Arc::new(onebot::api::ApiClient::new(action_tx.clone()));
+    let sender = Arc::new(sender::OutboundSender::new(action_tx.clone(), api.clone()));
     tokio::spawn(onebot::client::run(config.clone(), event_tx, action_rx));
 
     // Core 侧（按模式分支）
     let (core_emit_tx, core_emit_rx) = tokio::sync::mpsc::channel::<Value>(1024);
-    let (core_recv_tx, mut core_recv_rx) = tokio::sync::mpsc::channel::<Value>(256);
     match config.upstream_mode {
         UpstreamMode::Socketio => {
+            let (core_recv_tx, mut core_recv_rx) = tokio::sync::mpsc::channel::<Value>(256);
             tokio::spawn(upstream::run(config.clone(), core_emit_rx, core_recv_tx));
-        }
-        UpstreamMode::Plugin => {
-            tokio::spawn(plugin::gateway::run(config.clone(), core_emit_rx, core_recv_tx));
-        }
-    }
-
-    // 出站管线：Core 下发 → 编码 OneBot 动作列表 → NapCat（echo 与查询共用计数器）
-    let action_tx_out = action_tx.clone();
-    let api_out = api.clone();
-    let outbound_profile = config.protocol_end.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = core_recv_rx.recv().await {
-            let proxy = to_outbound_shape(&msg);
-            match outbound::build_outbound_actions(&proxy, &json!({}), &outbound_profile) {
-                Ok(actions) => {
-                    for action in actions {
-                        let frame = json!({
-                            "action": action.action,
-                            "params": action.params,
-                            "echo": api_out.next_echo(),
-                        });
-                        if action_tx_out.send(frame).await.is_err() {
-                            warn!("onebot action channel closed");
-                            return;
+            // socketio 模式：Core 经 "message" 事件下发；出站回执暂记日志（无 invoke 回执通道）
+            let sender_out = sender.clone();
+            let outbound_profile = config.protocol_end.clone();
+            tokio::spawn(async move {
+                while let Some(msg) = core_recv_rx.recv().await {
+                    let proxy = outbound::to_outbound_shape(&msg);
+                    match outbound::build_outbound_actions(&proxy, &json!({}), &outbound_profile) {
+                        Ok(actions) => {
+                            for action in actions {
+                                if let Err(e) = sender_out.send(action, false).await {
+                                    warn!(error = %e, "outbound send failed");
+                                }
+                            }
                         }
+                        Err(e) => warn!(error = %e, raw = %msg, "outbound encode failed"),
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, raw = %msg, "outbound encode failed");
-                }
-            }
+            });
         }
-    });
+        UpstreamMode::Plugin => {
+            tokio::spawn(plugin::gateway::run(config.clone(), core_emit_rx, sender.clone()));
+        }
+    }
 
     // ---- 事件分派协程：只解析帧并立刻分类 ----
     // 关键：回执必须在此立即 resolve_receipt，绝不能和入站转换在同一个循环里 await
     // ——convert_event 会 await 查询回执，若同循环会自死锁（等自己读的帧）。
     let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<Value>(1024);
     let api_dispatch = api.clone();
+    let sender_dispatch = sender.clone();
     tokio::spawn(async move {
         while let Some(raw) = event_rx.recv().await {
             let parsed: Value = match serde_json::from_str(&raw) {
@@ -93,10 +87,12 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
             };
-            // API 回执（带 echo）：优先喂给查询等待方，未匹配的记为出站回执
+            // API 回执（带 echo）：查询回执 → 出站等待回执 → 未匹配记日志
             if parsed.get("echo").is_some() && parsed.get("status").is_some() {
                 if api_dispatch.resolve_receipt(&parsed) {
                     debug!("onebot api receipt (query resolved)");
+                } else if sender_dispatch.resolve_receipt(&parsed) {
+                    debug!("onebot api receipt (outbound resolved)");
                 } else {
                     let actual_id = parsed
                         .pointer("/data/message_id")
@@ -138,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
             match inbound::convert_event(
                 &parsed,
                 &config_convert.platform_name,
-                Some(&api_convert),
+                Some(api_convert.as_ref()),
                 http.as_ref(),
             )
             .await
@@ -170,23 +166,4 @@ async fn main() -> anyhow::Result<()> {
     // 主线程保持存活（Ctrl-C 优雅退出）
     tokio::signal::ctrl_c().await?;
     Ok(())
-}
-
-/// Core 下发的消息可能是 MessageBase（message_segment 为 seglist）或
-/// MessageDict（raw_message 为段数组）。统一成出站编码器消费的形状。
-fn to_outbound_shape(msg: &Value) -> Value {
-    let message_info = msg.get("message_info").cloned().unwrap_or_else(|| json!({}));
-    let segments = msg
-        .get("raw_message")
-        .cloned()
-        .or_else(|| {
-            let seg = msg.get("message_segment")?;
-            if seg.get("type").and_then(Value::as_str) == Some("seglist") {
-                seg.get("data").cloned()
-            } else {
-                Some(json!([seg]))
-            }
-        })
-        .unwrap_or_else(|| json!([]));
-    json!({ "message_info": message_info, "raw_message": segments })
 }

@@ -2,11 +2,11 @@
 //!
 //! 入站：inbound.rs 产出的 MessageBase → 转 MessageDict（docs/event-schema.md §7.2）
 //!       → host.route_message（Host 侧用 dedupe_key 统一去重，本地不再去重）
-//! 出站：Host 调 plugin.invoke_message_gateway，args.message 是 MessageDict，
-//!       直接注入现有出站编码管线（outbound.rs 本就消费该形状）
+//! 出站：Host 调 plugin.invoke_message_gateway，串行 await 每个动作的平台回执，
+//!       同一响应带回 message_id_echo 回调（对齐 SnowLuma-Adapter plugin.py 出站流）。
 //!
-//! ⚠️ method 名 host.route_message / plugin.invoke_message_gateway 为推断值
-//! （依据 envelope.py 的 payload 类型与 plugin.invoke_* 命名规律），首次联调核对。
+//! ⚠️ method 名 host.route_message / plugin.invoke_message_gateway 已对照
+//! SnowLuma-Adapter plugin.py 核实（2026-11-04）。
 
 use anyhow::bail;
 use serde_json::{json, Value};
@@ -25,7 +25,7 @@ use crate::config::Config;
 pub async fn run(
     config: Config,
     mut emit_rx: mpsc::Receiver<Value>,
-    outbound_tx: mpsc::Sender<Value>,
+    outbound: Arc<crate::sender::OutboundSender>,
 ) -> anyhow::Result<()> {
     let mut backoff = config.reconnect_min_interval;
     loop {
@@ -36,7 +36,7 @@ pub async fn run(
                 backoff = config.reconnect_min_interval;
                 let client = Arc::new(client);
                 if let Err(e) =
-                    run_session(&config, client, &mut emit_rx, &outbound_tx, Instant::now()).await
+                    run_session(&config, client, &mut emit_rx, outbound.clone(), Instant::now()).await
                 {
                     warn!(error = %e, "plugin session ended, will reconnect");
                 }
@@ -52,7 +52,7 @@ async fn run_session(
     config: &Config,
     client: Arc<PluginClient>,
     emit_rx: &mut mpsc::Receiver<Value>,
-    outbound_tx: &mpsc::Sender<Value>,
+    outbound: Arc<crate::sender::OutboundSender>,
     start: Instant,
 ) -> anyhow::Result<()> {
     // ---- 注册 MessageGateway 组件（对齐 RegisterPluginPayload / ComponentDeclaration）----
@@ -85,9 +85,12 @@ async fn run_session(
     info!("message gateway component registered");
 
     // ---- Host → 本网关 的方法 ----
-    let out_tx = outbound_tx.clone();
+    // 出站流对齐 SnowLuma-Adapter plugin.py：串行 await 每个动作的平台回执，
+    // 在同一 invoke 响应里带回 message_id_echo 回调（internal != external 时）。
+    let profile = config.protocol_end.clone();
     let invoke_handler: MethodHandler = Arc::new(move |envelope: Envelope| {
-        let out_tx = out_tx.clone();
+        let outbound = outbound.clone();
+        let profile = profile.clone();
         Box::pin(async move {
             let message = envelope
                 .payload
@@ -95,9 +98,78 @@ async fn run_session(
                 .or(envelope.payload.get("args").and_then(|a| a.get("message")))
                 .cloned()
                 .unwrap_or(Value::Null);
-            let queued = out_tx.send(message).await.is_ok();
-            // 对齐 InvokeResultPayload；出站追踪的 echo 回调（adapter_callbacks）待实现
-            envelope.make_response(json!({ "success": queued, "result": { "adapter_callbacks": [] } }))
+            let internal_id = message
+                .get("message_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let proxy = crate::outbound::to_outbound_shape(&message);
+            match crate::outbound::build_outbound_actions(&proxy, &json!({}), &profile) {
+                Ok(actions) => {
+                    let action_names: Vec<String> =
+                        actions.iter().map(|a| a.action.clone()).collect();
+                    let mut external_id = String::new();
+                    for action in actions {
+                        match outbound.send(action, true).await {
+                            Ok(Some(receipt))
+                                if receipt.get("status").and_then(Value::as_str) == Some("ok") =>
+                            {
+                                if external_id.is_empty() {
+                                    external_id = receipt
+                                        .pointer("/data/message_id")
+                                        .or(receipt.pointer("/data/data/message_id"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_owned();
+                                }
+                            }
+                            Ok(Some(receipt)) => {
+                                let wording = receipt
+                                    .get("wording")
+                                    .or(receipt.get("message"))
+                                    .cloned()
+                                    .unwrap_or(Value::Null);
+                                return envelope.make_response(json!({
+                                    "success": false,
+                                    "error": format!("action failed: {wording}"),
+                                }));
+                            }
+                            Ok(None) => {
+                                return envelope.make_response(json!({
+                                    "success": false,
+                                    "error": "send receipt timeout",
+                                }));
+                            }
+                            Err(e) => {
+                                return envelope
+                                    .make_response(json!({ "success": false, "error": e.to_string() }));
+                            }
+                        }
+                    }
+                    let mut adapter_callbacks = vec![];
+                    if !internal_id.is_empty()
+                        && !external_id.is_empty()
+                        && internal_id != external_id
+                    {
+                        adapter_callbacks.push(json!({
+                            "name": "message_id_echo",
+                            "payload": { "content": { "type": "echo", "echo": internal_id, "actual_id": external_id } },
+                        }));
+                    }
+                    envelope.make_response(json!({
+                        "success": true,
+                        "external_message_id": if external_id.is_empty() { Value::Null } else { json!(external_id) },
+                        "metadata": {
+                            "action": action_names.first().cloned().unwrap_or_default(),
+                            "actions": action_names,
+                            "adapter_callbacks": adapter_callbacks,
+                        }
+                    }))
+                }
+                Err(e) => {
+                    envelope.make_response(json!({ "success": false, "error": e.to_string() }))
+                }
+            }
         })
     });
     client.register_method(METHOD_INVOKE_MESSAGE_GATEWAY, invoke_handler);

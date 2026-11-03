@@ -560,6 +560,25 @@ impl IfEmpty for String {
     }
 }
 
+/// Core 下发的消息可能是 MessageBase（message_segment 为 seglist）或
+/// MessageDict（raw_message 为段数组）。统一成出站编码器消费的形状。
+pub fn to_outbound_shape(msg: &Value) -> Value {
+    let message_info = msg.get("message_info").cloned().unwrap_or_else(|| json!({}));
+    let segments = msg
+        .get("raw_message")
+        .cloned()
+        .or_else(|| {
+            let seg = msg.get("message_segment")?;
+            if seg.get("type").and_then(Value::as_str) == Some("seglist") {
+                seg.get("data").cloned()
+            } else {
+                Some(json!([seg]))
+            }
+        })
+        .unwrap_or_else(|| json!([]));
+    json!({ "message_info": message_info, "raw_message": segments })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
