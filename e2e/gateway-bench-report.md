@@ -1,7 +1,7 @@
 FLOOD DONE
-=== RUST GATEWAY BENCH ===
+=== RUST GATEWAY BENCH v3 (nodelay fix) ===
 messages: 300, received: 300, missing: 0
-latency ms: p50=4161.8 p95=7815.86 p99=8137.0 max=8190.74 mean=4139.00
-throughput: 22.5 msg/s (wall 13.33s)
+latency ms: p50=0.09 p95=0.22 p99=0.3 max=0.93 mean=0.11
+throughput: 58.1 msg/s (wall 5.16s)
 === PYTHON ADAPTER CODEC (conversion only) ===
-py codec baseline unavailable: ModuleNotFoundError("No module named 'codecs.inbound'; 'codecs' is not a package")
+py codec baseline unavailable: AttributeError("module 'sla.codecs.inbound.message_codec' has no attribute 'NapCatMessageCodec'")
