@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use super::client::{MethodHandler, PluginClient};
 use super::envelope::{
     Envelope, METHOD_HEALTH, METHOD_INVOKE_MESSAGE_GATEWAY, METHOD_READY, METHOD_REGISTER,
-    METHOD_ROUTE_MESSAGE,
+    METHOD_ROUTE_MESSAGE, METHOD_UPDATE_GATEWAY_STATE,
 };
 use crate::config::Config;
 
@@ -220,6 +220,23 @@ async fn run_session(
         )
         .await?;
     info!("runner ready, routing inbound messages");
+
+    // 声明网关链路就绪（对齐真 Core 语义：route_message 前必须 ready，否则被拒）
+    let state_payload = json!({
+        "gateway_name": config.gateway_name,
+        "ready": true,
+        "platform": config.platform_name,
+        "account_id": config.self_id.clone().unwrap_or_default(),
+        "scope": "",
+        "metadata": {},
+    });
+    match client
+        .request(METHOD_UPDATE_GATEWAY_STATE, &config.plugin_id, state_payload, 10_000)
+        .await
+    {
+        Ok(resp) if resp.error.is_none() => info!("gateway ready state acknowledged"),
+        other => warn!(?other, "gateway state update not acknowledged"),
+    }
 
     // ---- 入站循环 ----
     while let Some(base) = emit_rx.recv().await {

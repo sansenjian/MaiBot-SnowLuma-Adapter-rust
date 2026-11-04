@@ -62,9 +62,15 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:8000".into()),
             core_token: std::env::var("CORE_TOKEN").ok().filter(|s| !s.is_empty()),
             plugin_host_address: std::env::var("PLUGIN_HOST_ADDRESS")
-                .unwrap_or_else(|_| "127.0.0.1:0".into()),
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("MAIBOT_IPC_ADDRESS").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| "127.0.0.1:0".into()),
             plugin_session_token: std::env::var("PLUGIN_SESSION_TOKEN")
-                .unwrap_or_else(|_| "".into()),
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("MAIBOT_SESSION_TOKEN").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_default(),
             plugin_id: std::env::var("PLUGIN_ID")
                 .unwrap_or_else(|_| "maibot_gateway_rust".into()),
             gateway_name: std::env::var("GATEWAY_NAME")

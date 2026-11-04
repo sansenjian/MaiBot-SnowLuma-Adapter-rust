@@ -55,7 +55,7 @@ async def inject_onebot_event():
     }
     await onebot_conn.send(json.dumps(event))
 
-host_events = {"hello": None, "register": None, "ready": None, "route": None, "invoke_resp": None}
+host_events = {"hello": None, "register": None, "ready": None, "route": None, "invoke_resp": None, "state_update": None}
 host_writer = None
 
 async def host_handler(reader, writer):
@@ -95,7 +95,20 @@ async def host_handler(reader, writer):
         elif method == "runner.ready":
             host_events["ready"] = payload
             out_payload = {}
+        elif method == "host.update_message_gateway_state":
+            host_events["state_update"] = payload
+            out_payload = {}
         elif method == "host.route_message":
+            if not (host_events["state_update"] or {}).get("ready"):
+                # 对齐真 Core：未声明就绪的网关拒绝收消息
+                data = struct.pack("!I", len(p := msgpack.packb(
+                    {"protocol_version": "1.0.0", "request_id": mid, "message_type": "response",
+                     "method": method, "plugin_id": "", "timestamp_ms": 0, "timeout_ms": 30000,
+                     "payload": None, "error": {"code": "E_STATE", "message": "gateway not ready", "details": {}}},
+                    use_bin_type=True))) + p
+                writer.write(data)
+                await writer.drain()
+                continue
             host_events["route"] = payload
             out_payload = {}
         else:
@@ -147,6 +160,11 @@ async def main():
         check("handshake-hello", host_events["hello"] is not None)
         check("register-components", host_events["register"] is not None)
         check("runner-ready", host_events["ready"] is not None)
+        check("gateway-state-update", (host_events["state_update"] or {}).get("ready") is True)
+        if host_events["state_update"]:
+            check("state-update-shape",
+                  (host_events["state_update"].get("gateway_name") == "napcat_gateway"
+                   and host_events["state_update"].get("platform") == "qq"))
 
         await inject_onebot_event()
         for _ in range(100):

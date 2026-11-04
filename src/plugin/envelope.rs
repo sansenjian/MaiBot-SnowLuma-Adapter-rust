@@ -125,6 +125,8 @@ pub const METHOD_REGISTER: &str = "plugin.register_components";
 pub const METHOD_READY: &str = "runner.ready";
 pub const METHOD_HEALTH: &str = "plugin.health";
 pub const METHOD_ROUTE_MESSAGE: &str = "host.route_message";
+/// 网关就绪声明（Core 的 route_message 会检查该状态；真 Core 代码核实 2026-11-04）
+pub const METHOD_UPDATE_GATEWAY_STATE: &str = "host.update_message_gateway_state";
 pub const METHOD_INVOKE_MESSAGE_GATEWAY: &str = "plugin.invoke_message_gateway";
 
 #[cfg(test)]
