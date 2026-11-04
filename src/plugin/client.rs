@@ -36,8 +36,12 @@ impl Rd {
         } as usize;
         let mut buf = vec![0u8; len];
         match self {
-            Rd::T(r) => r.read_exact(&mut buf).await?,
-            Rd::U(r) => r.read_exact(&mut buf).await?,
+            Rd::T(r) => {
+                r.read_exact(&mut buf).await?;
+            }
+            Rd::U(r) => {
+                r.read_exact(&mut buf).await?;
+            }
         }
         Ok(buf)
     }
