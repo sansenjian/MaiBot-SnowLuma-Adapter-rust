@@ -14,6 +14,54 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tracing::{error, info};
+use tokio::net::UnixStream;
+
+/// 传输层读写端（真 Core 用 Unix Domain Socket：/tmp/maibot-plugin-*.sock；
+/// 地址以 / 开头或 .sock 结尾时走 UDS，否则 TCP）
+enum Rd {
+    T(tokio::net::tcp::OwnedReadHalf),
+    U(tokio::net::unix::OwnedReadHalf),
+}
+
+enum Wr {
+    T(tokio::net::tcp::OwnedWriteHalf),
+    U(tokio::net::unix::OwnedWriteHalf),
+}
+
+impl Rd {
+    async fn read_frame(&mut self) -> std::io::Result<Vec<u8>> {
+        let len = match self {
+            Rd::T(r) => r.read_u32().await?,
+            Rd::U(r) => r.read_u32().await?,
+        } as usize;
+        let mut buf = vec![0u8; len];
+        match self {
+            Rd::T(r) => r.read_exact(&mut buf).await?,
+            Rd::U(r) => r.read_exact(&mut buf).await?,
+        }
+        Ok(buf)
+    }
+}
+
+impl Wr {
+    async fn write_frame(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        match self {
+            Wr::T(w) => {
+                w.write_u32(payload.len() as u32).await?;
+                w.write_all(payload).await
+            }
+            Wr::U(w) => {
+                w.write_u32(payload.len() as u32).await?;
+                w.write_all(payload).await
+            }
+        }
+    }
+}
+
+fn is_uds(address: &str) -> bool {
+    address.starts_with('/') || address.ends_with(".sock")
+}
+
 
 use super::envelope::{Envelope, MessageType, METHOD_HELLO};
 
