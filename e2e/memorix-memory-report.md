@@ -1,48 +1,32 @@
-# A_memorix 内存实测报告 v2（真实 v1.3.19）
+# A_memorix 内存实测报告 v3（真实 v1.3.19，2 万条 1536 维）
 
 ## Core 基线 RSS
 ```
-CORE_BASELINE_RSS_MB=37.6797
-CORE_RSS_AFTER_90S_MB=37.6641
+CORE_RSS_MB=37.4961
 ```
 
-## 灌向量实验
+## 实验数据
 ```
-[38;5;117m11-05 06:02:10[0m [38;5;154m[配置][0m [38;5;154mMaiCore 当前版本: 1.3.19[0m
-[38;5;117m11-05 06:02:10[0m [38;5;154m[配置][0m [38;5;154m正在品鉴配置文件...[0m
-[33m11-05 06:02:10[0m [38;5;154m[配置][0m [38;5;154m未配置视觉识图模型，部分图片理解可能受限，请在webui或model_config中配置[0m
-[38;5;117m11-05 06:02:10[0m [38;5;154m[配置][0m [38;5;154m非常的新鲜，非常的美味！[0m
-init: (self, dimension: int, quantization_type: src.A_memorix.core.utils.quantization.QuantizationType = <QuantizationType.INT8: 'int8'>, index_type: str = 'sq8', data_dir: Union[str, pathlib.Path, NoneType] = None, use_mmap: bool = True, buffer_size: int = 1024)
-add: (self, vectors: numpy.ndarray, ids: List[str]) -> int
-methods: ['DEFAULT_MIN_TRAIN', 'TRAIN_SIZE', '_flush_write_buffer', '_flush_write_buffer_unlocked', '_force_train_small_data', '_force_train_small_data_unlocked', '_train_and_replay', '_train_and_replay_unlocked', 'add', 'needs_training', 'search', 'warmup_index']
+[38;5;117m11-05 06:04:19[0m [38;5;154m[配置][0m [38;5;154mMaiCore 当前版本: 1.3.19[0m
+[38;5;117m11-05 06:04:19[0m [38;5;154m[配置][0m [38;5;154m正在品鉴配置文件...[0m
+[33m11-05 06:04:19[0m [38;5;154m[配置][0m [38;5;154m未配置视觉识图模型，部分图片理解可能受限，请在webui或model_config中配置[0m
+[38;5;117m11-05 06:04:19[0m [38;5;154m[配置][0m [38;5;154m非常的新鲜，非常的美味！[0m
 start_rss=161.2MB mmap=?
-add failed: ValueError('Vector IDs must be non-empty strings')
-INSERT DONE 20000 in 0.1s rss=196.8MB
-calling warmup_index() ...
-after warmup_index: rss=196.8MB main=0 fallback=0
-calling _train_and_replay() ...
-[33m11-05 06:02:12[0m [记忆向量存储] No training data available.
-after _train_and_replay: rss=196.8MB main=0 fallback=0
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-[33m11-05 06:02:14[0m [记忆向量存储] Indices are empty. No data to search.
-search(20): first=1.0ms avg20=0.14ms
+batch 2000: rss=232.5MB main=0 fallback=2000
+batch 4000: rss=268.0MB main=0 fallback=4000
+batch 6000: rss=309.3MB main=0 fallback=6000
+batch 8000: rss=309.3MB main=0 fallback=8000
+[38;5;117m11-05 06:04:20[0m [记忆向量存储] 训练样本达到上限，开始训练...
+[38;5;117m11-05 06:04:20[0m [记忆向量存储] Training Index with 10000 samples...
+[38;5;117m11-05 06:04:20[0m [记忆向量存储] Replaying data from disk to populate index...
+[38;5;117m11-05 06:04:20[0m [记忆向量存储] Replay successful (10000/10000). Releasing fallback index.
+batch 10000: rss=475.4MB main=10000 fallback=0
+batch 12000: rss=475.4MB main=12000 fallback=0
+batch 14000: rss=475.4MB main=14000 fallback=0
+batch 16000: rss=475.4MB main=16000 fallback=0
+batch 18000: rss=475.4MB main=18000 fallback=0
+batch 20000: rss=475.4MB main=20000 fallback=0
+ADDED=20000 in 0.9s rss=475.4MB
+warmup done in 0.0s rss=475.4MB main=20000 fallback=0
+search(20): first=18.0ms avg20=1.71ms rss=475.4MB
 ```
