@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tracing::{error, info};
@@ -22,7 +21,7 @@ type HandlerFuture = Pin<Box<dyn Future<Output = Envelope> + Send>>;
 pub type MethodHandler = Arc<dyn Fn(Envelope) -> HandlerFuture + Send + Sync>;
 
 pub struct PluginClient {
-    write: Arc<AsyncMutex<OwnedWriteHalf>>,
+    write: Arc<AsyncMutex<Wr>>,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Envelope>>>>,
     handlers: Arc<Mutex<HashMap<String, MethodHandler>>>,
     request_id: Arc<AtomicI64>,
@@ -32,10 +31,19 @@ pub struct PluginClient {
 impl PluginClient {
     /// 连接 Host 并完成 runner.hello 握手（对齐 connect_and_handshake）。
     pub async fn connect(host_address: &str, session_token: &str) -> anyhow::Result<PluginClient> {
-        let stream = TcpStream::connect(host_address)
-            .await
-            .with_context(|| format!("connect to plugin host {host_address}"))?;
-        let (mut read, write) = stream.into_split();
+        let (mut read, write) = if is_uds(host_address) {
+            let s = UnixStream::connect(host_address)
+                .await
+                .with_context(|| format!("connect to plugin host uds {host_address}"))?;
+            let (r, w) = s.into_split();
+            (Rd::U(r), Wr::U(w))
+        } else {
+            let s = TcpStream::connect(host_address)
+                .await
+                .with_context(|| format!("connect to plugin host tcp {host_address}"))?;
+            let (r, w) = s.into_split();
+            (Rd::T(r), Wr::T(w))
+        };
 
         let runner_id = uuid_v4();
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Envelope>>>> =
@@ -64,7 +72,7 @@ impl PluginClient {
             }),
         );
         client.send_frame(&hello).await?;
-        let hello_bytes = tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut read))
+        let hello_bytes = tokio::time::timeout(std::time::Duration::from_secs(10), read.read_frame())
             .await
             .context("runner.hello response timeout")??;
         let hello_resp: Envelope =
@@ -127,29 +135,25 @@ impl PluginClient {
     }
 }
 
-async fn send_frame(write: &Arc<AsyncMutex<OwnedWriteHalf>>, envelope: &Envelope) -> anyhow::Result<()> {
+async fn send_frame(write: &Arc<AsyncMutex<Wr>>, envelope: &Envelope) -> anyhow::Result<()> {
     // 对齐 Python Envelope（msgpack dict）：rmp-serde 默认把 struct 编成数组，
     // 必须经 serde_json::Value 中转保证字段名映射（Python 侧 dict["method"] 取值）。
     let value = serde_json::to_value(envelope).context("envelope to json value")?;
     let payload = rmp_serde::to_vec(&value).context("msgpack encode envelope")?;
     let mut guard = write.lock().await;
-    guard
-        .write_u32(payload.len() as u32)
-        .await
-        .context("write frame header")?;
-    guard.write_all(&payload).await.context("write frame body")?;
+    guard.write_frame(&payload).await.context("write frame")?;
     Ok(())
 }
 
 /// 读循环：分派 response / request / broadcast（对齐 _recv_loop）。
 async fn recv_loop(
-    mut read: OwnedReadHalf,
-    write: Arc<AsyncMutex<OwnedWriteHalf>>,
+    mut read: Rd,
+    write: Arc<AsyncMutex<Wr>>,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Envelope>>>>,
     handlers: Arc<Mutex<HashMap<String, MethodHandler>>>,
 ) {
     loop {
-        let frame = match read_frame(&mut read).await {
+        let frame = match read.read_frame().await {
             Ok(f) => f,
             Err(e) => {
                 info!("plugin host connection closed: {e}");
@@ -211,13 +215,6 @@ async fn recv_loop(
             ),
         });
     }
-}
-
-async fn read_frame(read: &mut OwnedReadHalf) -> anyhow::Result<Vec<u8>> {
-    let len = read.read_u32().await.context("read frame header")? as usize;
-    let mut buf = vec![0u8; len];
-    read.read_exact(&mut buf).await.context("read frame body")?;
-    Ok(buf)
 }
 
 fn uuid_v4() -> String {
