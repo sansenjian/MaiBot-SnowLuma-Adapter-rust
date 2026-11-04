@@ -49,15 +49,13 @@ impl Rd {
 
 impl Wr {
     async fn write_frame(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        // 头+载荷合并为单次写：分两次写会触发 Nagle+延迟 ACK 交互（实测 ~45ms/帧 stalls）
+        let mut frame = Vec::with_capacity(payload.len() + 4);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
         match self {
-            Wr::T(w) => {
-                w.write_u32(payload.len() as u32).await?;
-                w.write_all(payload).await
-            }
-            Wr::U(w) => {
-                w.write_u32(payload.len() as u32).await?;
-                w.write_all(payload).await
-            }
+            Wr::T(w) => w.write_all(&frame).await,
+            Wr::U(w) => w.write_all(&frame).await,
         }
     }
 }
@@ -93,6 +91,7 @@ impl PluginClient {
             let s = TcpStream::connect(host_address)
                 .await
                 .with_context(|| format!("connect to plugin host tcp {host_address}"))?;
+            s.set_nodelay(true).context("set nodelay")?;
             let (r, w) = s.into_split();
             (Rd::T(r), Wr::T(w))
         };
